@@ -1,0 +1,41 @@
+[package]
+name = "estrace"
+version = "0.2.2"
+edition = "2021"
+publish = false
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+syscalls = { version = "*", default-features = false, features = ["x86_64"] }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+syscalls = { version = "*", default-features = false, features = ["aarch64"] }
+
+[dependencies]
+aya = { git = "https://github.com/aya-rs/aya", branch = "main", features = [
+  "async_tokio",
+] }
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+clap = { version = "4", features = ["derive"] }
+common = { path = "../common" }
+bytes = "1"
+lazy_static = "1"
+colored = "2"
+libc = "0"
+bitflags = "2"
+regex = { version = "1", default-features = false, features = ["std"] }
+syn = "*"
+quote = "1"
+linux-raw-sys = "0.6.3"
+aligners = { version = "0.0.10", default-features = false }
+signal-hook = "0.3"
+async-pidfd = "0.1"
+
+[[bin]]
+name = "estrace"
+path = "src/main.rs"
+
+[lib]
+name = "macros"
+path = "src/syscall_info/macros.rs"
+proc-macro = true

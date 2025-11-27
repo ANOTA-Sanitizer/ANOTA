@@ -1,0 +1,16 @@
+[workspace]
+members = ["cli", "xtask", "common"]
+resolver = "1"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+debug = false
+debug-assertions = false
+incremental = false
+lto = true
+opt-level = 3
+overflow-checks = false

@@ -1,0 +1,8 @@
+[workspace]
+members = ["xtask", "syscall-tracepoint", "syscall-tracepoint-common"]
+
+[patch."https://github.com/aya-rs/aya"]
+aya = { path = "aya-src/aya" }
+aya-log = { path = "aya-src/aya-log" }
+aya-ebpf = { path = "aya-src/ebpf/aya-ebpf" }
+aya-log-ebpf = { path = "aya-src/ebpf/aya-log-ebpf" }

@@ -2,6 +2,7 @@
 
 #define PY_SSIZE_T_CLEAN
 #include "Python.h"
+#include "anota_taint.h"
 #include "pycore_abstract.h"      // _PyIndex_Check()
 #include "pycore_bytes_methods.h"
 #include "pycore_object.h"
@@ -143,6 +144,12 @@ PyByteArray_FromStringAndSize(const char *bytes, Py_ssize_t size)
     new->ob_start = new->ob_bytes;
     new->ob_exports = 0;
 
+    if (bytes != NULL && size > 0 &&
+        _PyAnotaTaint_ImportBuffer((PyObject *)new, bytes, size) < 0) {
+        Py_DECREF(new);
+        return NULL;
+    }
+
     return (PyObject *)new;
 }
 
@@ -161,6 +168,8 @@ PyByteArray_AsString(PyObject *self)
     assert(self != NULL);
     assert(PyByteArray_Check(self));
 
+    (void)_PyAnotaTaint_ExportBuffer(self, PyByteArray_AS_STRING(self),
+                                     PyByteArray_GET_SIZE(self));
     return PyByteArray_AS_STRING(self);
 }
 

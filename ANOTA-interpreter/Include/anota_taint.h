@@ -5,7 +5,6 @@ extern "C" {
 #endif
 
 #include "Python.h"
-#include "pycore_pystate.h"  /* PyThreadState */
 
 /* Python-level entry:
  *
@@ -24,19 +23,10 @@ PyAPI_FUNC(int) _PyAnotaTaint_Register(PyObject *obj,
                                        PyObject *sanitizers,
                                        PyObject *sinks);
 
-/* Called from ceval.c before invoking a callable via vectorcall:
- *
- *   - tstate: current thread state
- *   - func:   function/callable about to be invoked
- *   - stack:  base pointer to positional + keyword values
- *   - nargs:  number of positional arguments
- *   - nkwargs: number of keyword arguments
- *   - kwnames: keyword names tuple (may be NULL)
- *
- * Returns 0 on success (call allowed), -1 on error/violation (and sets
- * a RuntimeError for taint violations).
- */
-PyAPI_FUNC(int) _PyAnotaTaint_CheckVectorcall(
+/* Collect taint sources participating in a call and validate sink rules.
+ * Returns a new reference to a tuple of taint ids on success, or NULL on
+ * error/violation (with an exception set). */
+PyAPI_FUNC(PyObject *) _PyAnotaTaint_CheckVectorcall(
     PyThreadState *tstate,
     PyObject *func,
     PyObject *const *stack,
@@ -45,9 +35,8 @@ PyAPI_FUNC(int) _PyAnotaTaint_CheckVectorcall(
     PyObject *kwnames);
 
 
-
 /* Helper for CALL_FUNCTION_EX-style calls (args tuple + kwargs dict). */
-PyAPI_FUNC(int) _PyAnotaTaint_CheckTupleDictCall(
+PyAPI_FUNC(PyObject *) _PyAnotaTaint_CheckTupleDictCall(
     PyThreadState *tstate,
     PyObject *func,
     PyObject *args_tuple,   /* tuple of positional args, may be empty */
@@ -64,8 +53,26 @@ PyAPI_FUNC(void) _PyAnotaTaint_Propagate(PyObject *source, PyObject *target);
  */
 PyAPI_FUNC(void) _PyAnotaTaint_PropagateBinary(PyObject *left, PyObject *right, PyObject *result);
 
-/* Update PostCall to accept taint_source_found flag */
-PyAPI_FUNC(void) _PyAnotaTaint_PostCall(PyObject *func, PyObject *result, int taint_source_found);
+/* Apply post-call taint propagation/sanitization based on the collected
+ * taint sources returned by _PyAnotaTaint_Check*(). */
+PyAPI_FUNC(void) _PyAnotaTaint_PostCall(PyObject *func, PyObject *result, PyObject *taint_sources);
+
+PyAPI_FUNC(int) _PyAnotaTaint_IsTainted(PyObject *obj);
+
+/* Export Python-object taint into native memory tracked by DFSan. */
+PyAPI_FUNC(int) _PyAnotaTaint_ExportBuffer(PyObject *source,
+                                           void *buf,
+                                           Py_ssize_t size);
+PyAPI_FUNC(int) _PyAnotaTaint_ImportBuffer(PyObject *target,
+                                           const void *buf,
+                                           Py_ssize_t size);
+
+/* Track DFSan-backed native sink violations across a PyCFunction call. */
+PyAPI_FUNC(void) _PyAnotaTaint_NativeCallBegin(void);
+PyAPI_FUNC(int) _PyAnotaTaint_NativeCallEnd(PyObject *func);
+PyAPI_FUNC(int) _PyAnotaTaint_RecordNativeSinkLabel(const char *sink_name,
+                                                    int fd,
+                                                    unsigned int label);
 
 #ifdef __cplusplus
 }

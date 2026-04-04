@@ -3,6 +3,7 @@
 #define PY_SSIZE_T_CLEAN
 
 #include "Python.h"
+#include "anota_taint.h"
 #include "pycore_abstract.h"      // _PyIndex_Check()
 #include "pycore_bytes_methods.h" // _Py_bytes_startswith()
 #include "pycore_format.h"        // F_LJUST
@@ -163,6 +164,11 @@ PyBytes_FromStringAndSize(const char *str, Py_ssize_t size)
         return (PyObject *) op;
 
     memcpy(op->ob_sval, str, size);
+    if (size > 1 &&
+        _PyAnotaTaint_ImportBuffer((PyObject *)op, str, size) < 0) {
+        Py_DECREF(op);
+        return NULL;
+    }
     /* share short strings */
     if (size == 1) {
         struct _Py_bytes_state *state = get_bytes_state();
@@ -206,6 +212,11 @@ PyBytes_FromString(const char *str)
     _PyObject_InitVar((PyVarObject*)op, &PyBytes_Type, size);
     op->ob_shash = -1;
     memcpy(op->ob_sval, str, size+1);
+    if (size > 1 &&
+        _PyAnotaTaint_ImportBuffer((PyObject *)op, str, (Py_ssize_t)size) < 0) {
+        Py_DECREF(op);
+        return NULL;
+    }
     /* share short strings */
     if (size == 1) {
         assert(state->characters[*str & UCHAR_MAX] == NULL);
@@ -1241,6 +1252,8 @@ PyBytes_AsString(PyObject *op)
              "expected bytes, %.200s found", Py_TYPE(op)->tp_name);
         return NULL;
     }
+    (void)_PyAnotaTaint_ExportBuffer(op, ((PyBytesObject *)op)->ob_sval,
+                                     PyBytes_GET_SIZE(op));
     return ((PyBytesObject *)op)->ob_sval;
 }
 
@@ -1266,6 +1279,9 @@ PyBytes_AsStringAndSize(PyObject *obj,
     else if (strlen(*s) != (size_t)PyBytes_GET_SIZE(obj)) {
         PyErr_SetString(PyExc_ValueError,
                         "embedded null byte");
+        return -1;
+    }
+    if (_PyAnotaTaint_ExportBuffer(obj, *s, PyBytes_GET_SIZE(obj)) < 0) {
         return -1;
     }
     return 0;

@@ -1,0 +1,4 @@
+fun:Py*=uninstrumented
+fun:Py*=discard
+fun:_Py*=uninstrumented
+fun:_Py*=discard

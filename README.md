@@ -1,23 +1,50 @@
-# Anota: Identifying Business Logic Vulnerabilities via Annotation-Based Sanitization
+# ANOTA: Identifying Business Logic Vulnerabilities via Annotation-Based Sanitization
 
-This repository contains the full artifact for the ANOTA paper. Each subdirectory ships with its own README that documents build steps, test procedures, and evaluation notes. The top-level README stays intentionally high level and simply orients you toward the right component.
+This repository contains the artifact for the ANOTA paper.
 
----
+The top-level README is a map of the repository. Build steps, test procedures,
+and evaluation details live in the README files inside each major component.
 
-## Directory Overview
+## Start Here
 
-- [`ANOTA-interpreter/`](ANOTA-interpreter/) – ANOTA’s CPython 3.10.13 fork that introduces the `ANOTA_EXECUTION`, `ANOTA_WATCH`, `ANOTA_TAINT`, and `ANOTA_SYSCALL` primitives. See `ANOTA-interpreter/README.md` for detailed build and validation instructions.
-- [`ANOTA-interpreter/syscall-module/`](ANOTA-interpreter/syscall-module/) – Rust workspace that provides the eBPF tracepoints used by the syscall policies. Refer to `ANOTA-interpreter/syscall-module/README.md`.
-- [`SupplementaryMaterials/annotation_study_details.md`](SupplementaryMaterials/annotation_study_details.md) – Details about the annotation user study participants, feedback, and results.
-- [`SupplementaryMaterials/cmp-with-DBI/`](SupplementaryMaterials/cmp-with-DBI/) – DynamoRIO and Valgrind memory-tracing baselines plus the scripts used for the performance comparison in the paper.
-- [`SupplementaryMaterials/cmp-with-DBI/perf-data/`](SupplementaryMaterials/cmp-with-DBI/perf-data/) – Supplementary data for performance comparison with DBIs.
-- [`SupplementaryMaterials/cwe_top_40.md`](SupplementaryMaterials/cwe_top_40.md) – Analysis of Anota's support for the CWE Top 40 Security Weaknesses.
-- [`SupplementaryMaterials/perf-benchmark.md`](SupplementaryMaterials/perf-benchmark.md) – Performance evaluation details and benchmark results.
-- [`SupplementaryMaterials/skipped_applications.md`](SupplementaryMaterials/skipped_applications.md) – List of applications skipped in the evaluation and the reasons.
-- [`SupplementaryMaterials/user-study/`](SupplementaryMaterials/user-study/) – Annotation training packet and real-world developer survey materials.
+- To build the instrumented CPython fork and run the ANOTA tests, read
+  [`ANOTA-interpreter/README.md`](ANOTA-interpreter/README.md).
+- To work with the syscall tracing backend directly, read
+  [`ANOTA-interpreter/syscall-module/README.md`](ANOTA-interpreter/syscall-module/README.md).
+- To reproduce the performance comparison against DBI-based baselines, start in
+  [`SupplementaryMaterials/cmp-with-DBI/`](SupplementaryMaterials/cmp-with-DBI/).
+- To review the user-study materials, start in
+  [`SupplementaryMaterials/user-study/`](SupplementaryMaterials/user-study/).
 
+## Repository Layout
 
----
+- [`ANOTA-interpreter/`](ANOTA-interpreter/) contains ANOTA's CPython 3.10.13
+  fork. It implements `ANOTA_EXECUTION`, `ANOTA_WATCH`, `ANOTA_TAINT`, and
+  `ANOTA_SYSCALL`, and it documents the `WATCH.CON` timing test,
+  object-identity taint tracking, and the current native instrumentation
+  support.
+- [`ANOTA-interpreter/syscall-module/`](ANOTA-interpreter/syscall-module/)
+  contains the Rust workspace for the eBPF tracepoint components used by the
+  syscall policy system.
+- [`SupplementaryMaterials/annotation_study_details.md`](SupplementaryMaterials/annotation_study_details.md)
+  contains participant details, feedback, and results for the annotation
+  study.
+- [`SupplementaryMaterials/cmp-with-DBI/`](SupplementaryMaterials/cmp-with-DBI/)
+  contains the DynamoRIO and Valgrind memory-tracing baselines, plus the
+  scripts used for the paper's performance comparison.
+- [`SupplementaryMaterials/cmp-with-DBI/perf-data/`](SupplementaryMaterials/cmp-with-DBI/perf-data/)
+  contains the supplementary performance-comparison data for the DBI baselines.
+- [`SupplementaryMaterials/cwe_top_40.md`](SupplementaryMaterials/cwe_top_40.md)
+  contains the analysis of ANOTA's coverage of the CWE Top 40 Security
+  Weaknesses.
+- [`SupplementaryMaterials/perf-benchmark.md`](SupplementaryMaterials/perf-benchmark.md)
+  contains the benchmark setup and performance evaluation results.
+- [`SupplementaryMaterials/skipped_applications.md`](SupplementaryMaterials/skipped_applications.md)
+  contains the list of applications excluded from the evaluation, with
+  reasons.
+- [`SupplementaryMaterials/user-study/`](SupplementaryMaterials/user-study/)
+  contains the annotation training materials and survey assets for the
+  real-world developer study.
 
 ## How to Navigate the Artifact
 

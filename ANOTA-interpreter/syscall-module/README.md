@@ -58,7 +58,7 @@ After compiling the daemon, you can run the Python-side integration test (from
 the repo root) to ensure end-to-end communication works:
 
 ```bash
-./python anota_syscall_integration_test.py
+./python ANOTA-tests/anota_syscall_integration_test.py
 ```
 
 This script automatically builds the Rust binary if needed, starts it with

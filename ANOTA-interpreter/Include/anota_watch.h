@@ -31,6 +31,39 @@ PyAPI_FUNC(int) _PyAnota_CheckWriteMember(PyThreadState *tstate,
                                           PyObject *container,
                                           PyObject *key);
 
+#define Py_ANOTA_NATIVE_WATCH_MAX_SPECS 4
+
+typedef struct {
+    int active;
+    int read_fd;
+    int tracer_pid;
+    int spec_count;
+    PyObject *objects[Py_ANOTA_NATIVE_WATCH_MAX_SPECS];
+    void *addresses[Py_ANOTA_NATIVE_WATCH_MAX_SPECS];
+    Py_ssize_t sizes[Py_ANOTA_NATIVE_WATCH_MAX_SPECS];
+} _PyAnotaNativeWatchGuard;
+
+PyAPI_FUNC(int) _PyAnota_NativeWatchBeginVectorcall(
+    PyThreadState *tstate,
+    PyObject *func,
+    PyObject *const *args,
+    Py_ssize_t nargs,
+    Py_ssize_t nkwargs,
+    PyObject *kwnames,
+    _PyAnotaNativeWatchGuard *guard);
+
+PyAPI_FUNC(int) _PyAnota_NativeWatchBeginTupleDictCall(
+    PyThreadState *tstate,
+    PyObject *func,
+    PyObject *args_tuple,
+    PyObject *kwargs_dict,
+    _PyAnotaNativeWatchGuard *guard);
+
+PyAPI_FUNC(int) _PyAnota_NativeWatchEnd(
+    PyThreadState *tstate,
+    PyObject *func,
+    _PyAnotaNativeWatchGuard *guard);
+
 #ifdef __cplusplus
 }
 #endif

@@ -2,6 +2,8 @@
 /* Method object implementation */
 
 #include "Python.h"
+#include "anota_taint.h"
+#include "anota_watch.h"
 #include "pycore_ceval.h"         // _Py_EnterRecursiveCall()
 #include "pycore_object.h"
 #include "pycore_pyerrors.h"
@@ -418,6 +420,8 @@ cfunction_vectorcall_FASTCALL(
     PyObject *func, PyObject *const *args, size_t nargsf, PyObject *kwnames)
 {
     PyThreadState *tstate = _PyThreadState_GET();
+    _PyAnotaNativeWatchGuard native_watch = {0};
+
     if (cfunction_check_kwargs(tstate, func, kwnames)) {
         return NULL;
     }
@@ -427,8 +431,22 @@ cfunction_vectorcall_FASTCALL(
     if (meth == NULL) {
         return NULL;
     }
+    if (_PyAnota_NativeWatchBeginVectorcall(
+            tstate, func, args, nargs, 0, kwnames, &native_watch) < 0) {
+        _Py_LeaveRecursiveCall(tstate);
+        return NULL;
+    }
+    _PyAnotaTaint_NativeCallBegin();
     PyObject *result = meth(PyCFunction_GET_SELF(func), args, nargs);
     _Py_LeaveRecursiveCall(tstate);
+    if (_PyAnota_NativeWatchEnd(tstate, func, &native_watch) < 0) {
+        Py_XDECREF(result);
+        return NULL;
+    }
+    if (_PyAnotaTaint_NativeCallEnd(func) < 0) {
+        Py_XDECREF(result);
+        return NULL;
+    }
     return result;
 }
 
@@ -437,14 +455,31 @@ cfunction_vectorcall_FASTCALL_KEYWORDS(
     PyObject *func, PyObject *const *args, size_t nargsf, PyObject *kwnames)
 {
     PyThreadState *tstate = _PyThreadState_GET();
+    _PyAnotaNativeWatchGuard native_watch = {0};
     Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
     _PyCFunctionFastWithKeywords meth = (_PyCFunctionFastWithKeywords)
                                         cfunction_enter_call(tstate, func);
     if (meth == NULL) {
         return NULL;
     }
+    if (_PyAnota_NativeWatchBeginVectorcall(
+            tstate, func, args, nargs,
+            kwnames ? PyTuple_GET_SIZE(kwnames) : 0, kwnames,
+            &native_watch) < 0) {
+        _Py_LeaveRecursiveCall(tstate);
+        return NULL;
+    }
+    _PyAnotaTaint_NativeCallBegin();
     PyObject *result = meth(PyCFunction_GET_SELF(func), args, nargs, kwnames);
     _Py_LeaveRecursiveCall(tstate);
+    if (_PyAnota_NativeWatchEnd(tstate, func, &native_watch) < 0) {
+        Py_XDECREF(result);
+        return NULL;
+    }
+    if (_PyAnotaTaint_NativeCallEnd(func) < 0) {
+        Py_XDECREF(result);
+        return NULL;
+    }
     return result;
 }
 
@@ -454,13 +489,30 @@ cfunction_vectorcall_FASTCALL_KEYWORDS_METHOD(
 {
     PyThreadState *tstate = _PyThreadState_GET();
     PyTypeObject *cls = PyCFunction_GET_CLASS(func);
+    _PyAnotaNativeWatchGuard native_watch = {0};
     Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
     PyCMethod meth = (PyCMethod)cfunction_enter_call(tstate, func);
     if (meth == NULL) {
         return NULL;
     }
+    if (_PyAnota_NativeWatchBeginVectorcall(
+            tstate, func, args, nargs,
+            kwnames ? PyTuple_GET_SIZE(kwnames) : 0, kwnames,
+            &native_watch) < 0) {
+        _Py_LeaveRecursiveCall(tstate);
+        return NULL;
+    }
+    _PyAnotaTaint_NativeCallBegin();
     PyObject *result = meth(PyCFunction_GET_SELF(func), cls, args, nargs, kwnames);
     _Py_LeaveRecursiveCall(tstate);
+    if (_PyAnota_NativeWatchEnd(tstate, func, &native_watch) < 0) {
+        Py_XDECREF(result);
+        return NULL;
+    }
+    if (_PyAnotaTaint_NativeCallEnd(func) < 0) {
+        Py_XDECREF(result);
+        return NULL;
+    }
     return result;
 }
 
@@ -469,6 +521,7 @@ cfunction_vectorcall_NOARGS(
     PyObject *func, PyObject *const *args, size_t nargsf, PyObject *kwnames)
 {
     PyThreadState *tstate = _PyThreadState_GET();
+    _PyAnotaNativeWatchGuard native_watch = {0};
     if (cfunction_check_kwargs(tstate, func, kwnames)) {
         return NULL;
     }
@@ -486,8 +539,22 @@ cfunction_vectorcall_NOARGS(
     if (meth == NULL) {
         return NULL;
     }
+    if (_PyAnota_NativeWatchBeginVectorcall(
+            tstate, func, args, 0, 0, kwnames, &native_watch) < 0) {
+        _Py_LeaveRecursiveCall(tstate);
+        return NULL;
+    }
+    _PyAnotaTaint_NativeCallBegin();
     PyObject *result = meth(PyCFunction_GET_SELF(func), NULL);
     _Py_LeaveRecursiveCall(tstate);
+    if (_PyAnota_NativeWatchEnd(tstate, func, &native_watch) < 0) {
+        Py_XDECREF(result);
+        return NULL;
+    }
+    if (_PyAnotaTaint_NativeCallEnd(func) < 0) {
+        Py_XDECREF(result);
+        return NULL;
+    }
     return result;
 }
 
@@ -496,6 +563,7 @@ cfunction_vectorcall_O(
     PyObject *func, PyObject *const *args, size_t nargsf, PyObject *kwnames)
 {
     PyThreadState *tstate = _PyThreadState_GET();
+    _PyAnotaNativeWatchGuard native_watch = {0};
     if (cfunction_check_kwargs(tstate, func, kwnames)) {
         return NULL;
     }
@@ -513,8 +581,22 @@ cfunction_vectorcall_O(
     if (meth == NULL) {
         return NULL;
     }
+    if (_PyAnota_NativeWatchBeginVectorcall(
+            tstate, func, args, 1, 0, kwnames, &native_watch) < 0) {
+        _Py_LeaveRecursiveCall(tstate);
+        return NULL;
+    }
+    _PyAnotaTaint_NativeCallBegin();
     PyObject *result = meth(PyCFunction_GET_SELF(func), args[0]);
     _Py_LeaveRecursiveCall(tstate);
+    if (_PyAnota_NativeWatchEnd(tstate, func, &native_watch) < 0) {
+        Py_XDECREF(result);
+        return NULL;
+    }
+    if (_PyAnotaTaint_NativeCallEnd(func) < 0) {
+        Py_XDECREF(result);
+        return NULL;
+    }
     return result;
 }
 
@@ -525,6 +607,7 @@ cfunction_call(PyObject *func, PyObject *args, PyObject *kwargs)
     assert(kwargs == NULL || PyDict_Check(kwargs));
 
     PyThreadState *tstate = _PyThreadState_GET();
+    _PyAnotaNativeWatchGuard native_watch = {0};
     assert(!_PyErr_Occurred(tstate));
 
     int flags = PyCFunction_GET_FLAGS(func);
@@ -539,6 +622,11 @@ cfunction_call(PyObject *func, PyObject *args, PyObject *kwargs)
     PyObject *self = PyCFunction_GET_SELF(func);
 
     PyObject *result;
+    if (_PyAnota_NativeWatchBeginTupleDictCall(
+            tstate, func, args, kwargs, &native_watch) < 0) {
+        return NULL;
+    }
+    _PyAnotaTaint_NativeCallBegin();
     if (flags & METH_KEYWORDS) {
         result = (*(PyCFunctionWithKeywords)(void(*)(void))meth)(self, args, kwargs);
     }
@@ -550,6 +638,14 @@ cfunction_call(PyObject *func, PyObject *args, PyObject *kwargs)
             return NULL;
         }
         result = meth(self, args);
+    }
+    if (_PyAnota_NativeWatchEnd(tstate, func, &native_watch) < 0) {
+        Py_XDECREF(result);
+        return NULL;
+    }
+    if (_PyAnotaTaint_NativeCallEnd(func) < 0) {
+        Py_XDECREF(result);
+        return NULL;
     }
     return _Py_CheckFunctionResult(tstate, func, result, NULL);
 }

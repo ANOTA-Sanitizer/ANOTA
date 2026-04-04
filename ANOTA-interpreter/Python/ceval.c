@@ -1886,6 +1886,10 @@ main_loop:
         case TARGET(STORE_FAST): {
             PREDICTED(STORE_FAST);
             PyObject *value = POP();
+            if (_PyAnota_CheckWriteObject(tstate, value) < 0) {
+                Py_DECREF(value);
+                goto error;
+            }
             SETLOCAL(oparg, value);
             DISPATCH();
         }
@@ -1996,12 +2000,15 @@ main_loop:
             PyObject *exp = POP();
             PyObject *base = TOP();
             PyObject *res = PyNumber_Power(base, exp, Py_None);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(base);
+                Py_DECREF(exp);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(base, exp, res);
             Py_DECREF(base);
             Py_DECREF(exp);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(base, exp, res);
             DISPATCH();
         }
 
@@ -2009,12 +2016,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *res = PyNumber_Multiply(left, right);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, res);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, res);
             DISPATCH();
         }
 
@@ -2022,12 +2032,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *res = PyNumber_MatrixMultiply(left, right);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, res);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, res);
             DISPATCH();
         }
 
@@ -2035,12 +2048,15 @@ main_loop:
             PyObject *divisor = POP();
             PyObject *dividend = TOP();
             PyObject *quotient = PyNumber_TrueDivide(dividend, divisor);
+            SET_TOP(quotient);
+            if (quotient == NULL) {
+                Py_DECREF(dividend);
+                Py_DECREF(divisor);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(dividend, divisor, quotient);
             Py_DECREF(dividend);
             Py_DECREF(divisor);
-            SET_TOP(quotient);
-            if (quotient == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(dividend, divisor, quotient);
             DISPATCH();
         }
 
@@ -2048,12 +2064,15 @@ main_loop:
             PyObject *divisor = POP();
             PyObject *dividend = TOP();
             PyObject *quotient = PyNumber_FloorDivide(dividend, divisor);
+            SET_TOP(quotient);
+            if (quotient == NULL) {
+                Py_DECREF(dividend);
+                Py_DECREF(divisor);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(dividend, divisor, quotient);
             Py_DECREF(dividend);
             Py_DECREF(divisor);
-            SET_TOP(quotient);
-            if (quotient == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(dividend, divisor, quotient);
             DISPATCH();
         }
 
@@ -2069,12 +2088,15 @@ main_loop:
             } else {
               res = PyNumber_Remainder(dividend, divisor);
             }
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(divisor);
+                Py_DECREF(dividend);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(dividend, divisor, res);
             Py_DECREF(divisor);
             Py_DECREF(dividend);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(dividend, divisor, res);
             DISPATCH();
         }
 
@@ -2082,6 +2104,8 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *sum;
+            Py_INCREF(left);
+            Py_INCREF(right);
             /* NOTE(vstinner): Please don't try to micro-optimize int+int on
                CPython using bytecode, it is simply worthless.
                See http://bugs.python.org/issue21955 and
@@ -2097,11 +2121,17 @@ main_loop:
                 sum = PyNumber_Add(left, right);
                 Py_DECREF(left);
             }
-            Py_DECREF(right);
             SET_TOP(sum);
-            if (sum == NULL)
+            if (sum == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                Py_DECREF(right);
                 goto error;
+            }
             _PyAnotaTaint_PropagateBinary(left, right, sum);
+            Py_DECREF(left);
+            Py_DECREF(right);
+            Py_DECREF(right);
             DISPATCH();
         }
 
@@ -2109,12 +2139,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *diff = PyNumber_Subtract(left, right);
+            SET_TOP(diff);
+            if (diff == NULL) {
+                Py_DECREF(right);
+                Py_DECREF(left);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, diff);
             Py_DECREF(right);
             Py_DECREF(left);
-            SET_TOP(diff);
-            if (diff == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, diff);
             DISPATCH();
         }
 
@@ -2126,12 +2159,15 @@ main_loop:
                 goto error;
             }
             PyObject *res = PyObject_GetItem(container, sub);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(container);
+                Py_DECREF(sub);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(container, sub, res);
             Py_DECREF(container);
             Py_DECREF(sub);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(container, sub, res);
             DISPATCH();
         }
 
@@ -2139,12 +2175,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *res = PyNumber_Lshift(left, right);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, res);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, res);
             DISPATCH();
         }
 
@@ -2152,12 +2191,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *res = PyNumber_Rshift(left, right);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, res);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, res);
             DISPATCH();
         }
 
@@ -2165,12 +2207,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *res = PyNumber_And(left, right);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, res);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, res);
             DISPATCH();
         }
 
@@ -2178,12 +2223,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *res = PyNumber_Xor(left, right);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, res);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, res);
             DISPATCH();
         }
 
@@ -2191,12 +2239,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *res = PyNumber_Or(left, right);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, res);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, res);
             DISPATCH();
         }
 
@@ -2204,6 +2255,10 @@ main_loop:
             PyObject *v = POP();
             PyObject *list = PEEK(oparg);
             int err;
+            if (_PyAnota_CheckWriteObject(tstate, list) < 0) {
+                Py_DECREF(v);
+                goto error;
+            }
             err = PyList_Append(list, v);
             Py_DECREF(v);
             if (err != 0)
@@ -2216,6 +2271,10 @@ main_loop:
             PyObject *v = POP();
             PyObject *set = PEEK(oparg);
             int err;
+            if (_PyAnota_CheckWriteObject(tstate, set) < 0) {
+                Py_DECREF(v);
+                goto error;
+            }
             err = PySet_Add(set, v);
             Py_DECREF(v);
             if (err != 0)
@@ -2228,12 +2287,15 @@ main_loop:
             PyObject *exp = POP();
             PyObject *base = TOP();
             PyObject *res = PyNumber_InPlacePower(base, exp, Py_None);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(base);
+                Py_DECREF(exp);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(base, exp, res);
             Py_DECREF(base);
             Py_DECREF(exp);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(base, exp, res);
             DISPATCH();
         }
 
@@ -2241,12 +2303,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *res = PyNumber_InPlaceMultiply(left, right);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, res);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, res);
             DISPATCH();
         }
 
@@ -2254,12 +2319,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *res = PyNumber_InPlaceMatrixMultiply(left, right);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, res);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, res);
             DISPATCH();
         }
 
@@ -2267,12 +2335,15 @@ main_loop:
             PyObject *divisor = POP();
             PyObject *dividend = TOP();
             PyObject *quotient = PyNumber_InPlaceTrueDivide(dividend, divisor);
+            SET_TOP(quotient);
+            if (quotient == NULL) {
+                Py_DECREF(dividend);
+                Py_DECREF(divisor);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(dividend, divisor, quotient);
             Py_DECREF(dividend);
             Py_DECREF(divisor);
-            SET_TOP(quotient);
-            if (quotient == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(dividend, divisor, quotient);
             DISPATCH();
         }
 
@@ -2280,12 +2351,15 @@ main_loop:
             PyObject *divisor = POP();
             PyObject *dividend = TOP();
             PyObject *quotient = PyNumber_InPlaceFloorDivide(dividend, divisor);
+            SET_TOP(quotient);
+            if (quotient == NULL) {
+                Py_DECREF(dividend);
+                Py_DECREF(divisor);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(dividend, divisor, quotient);
             Py_DECREF(dividend);
             Py_DECREF(divisor);
-            SET_TOP(quotient);
-            if (quotient == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(dividend, divisor, quotient);
             DISPATCH();
         }
 
@@ -2293,12 +2367,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *mod = PyNumber_InPlaceRemainder(left, right);
+            SET_TOP(mod);
+            if (mod == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, mod);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(mod);
-            if (mod == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, mod);
             DISPATCH();
         }
 
@@ -2306,6 +2383,8 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *sum;
+            Py_INCREF(left);
+            Py_INCREF(right);
             if (PyUnicode_CheckExact(left) && PyUnicode_CheckExact(right)) {
                 sum = unicode_concatenate(tstate, left, right, f, next_instr);
                 /* unicode_concatenate consumed the ref to left */
@@ -2314,11 +2393,17 @@ main_loop:
                 sum = PyNumber_InPlaceAdd(left, right);
                 Py_DECREF(left);
             }
-            Py_DECREF(right);
             SET_TOP(sum);
-            if (sum == NULL)
+            if (sum == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                Py_DECREF(right);
                 goto error;
+            }
             _PyAnotaTaint_PropagateBinary(left, right, sum);
+            Py_DECREF(left);
+            Py_DECREF(right);
+            Py_DECREF(right);
             DISPATCH();
         }
 
@@ -2326,12 +2411,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *diff = PyNumber_InPlaceSubtract(left, right);
+            SET_TOP(diff);
+            if (diff == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, diff);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(diff);
-            if (diff == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, diff);
             DISPATCH();
         }
 
@@ -2339,12 +2427,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *res = PyNumber_InPlaceLshift(left, right);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, res);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, res);
             DISPATCH();
         }
 
@@ -2352,12 +2443,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *res = PyNumber_InPlaceRshift(left, right);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, res);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, res);
             DISPATCH();
         }
 
@@ -2365,12 +2459,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *res = PyNumber_InPlaceAnd(left, right);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, res);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, res);
             DISPATCH();
         }
 
@@ -2378,12 +2475,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *res = PyNumber_InPlaceXor(left, right);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, res);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, res);
             DISPATCH();
         }
 
@@ -2391,12 +2491,15 @@ main_loop:
             PyObject *right = POP();
             PyObject *left = TOP();
             PyObject *res = PyNumber_InPlaceOr(left, right);
+            SET_TOP(res);
+            if (res == NULL) {
+                Py_DECREF(left);
+                Py_DECREF(right);
+                goto error;
+            }
+            _PyAnotaTaint_PropagateBinary(left, right, res);
             Py_DECREF(left);
             Py_DECREF(right);
-            SET_TOP(res);
-            if (res == NULL)
-                goto error;
-            _PyAnotaTaint_PropagateBinary(left, right, res);
             DISPATCH();
         }
 
@@ -2423,6 +2526,9 @@ main_loop:
             PyObject *sub = TOP();
             PyObject *container = SECOND();
             int err;
+            if (_PyAnota_CheckWriteMember(tstate, container, sub) < 0) {
+                goto error;
+            }
             STACK_SHRINK(2);
             /* del container[sub] */
             err = PyObject_DelItem(container, sub);
@@ -2807,6 +2913,10 @@ main_loop:
                 Py_DECREF(v);
                 goto error;
             }
+            if (_PyAnota_CheckWriteMember(tstate, ns, name) < 0) {
+                Py_DECREF(v);
+                goto error;
+            }
             if (PyDict_CheckExact(ns))
                 err = PyDict_SetItem(ns, name, v);
             else
@@ -2824,6 +2934,9 @@ main_loop:
             if (ns == NULL) {
                 _PyErr_Format(tstate, PyExc_SystemError,
                               "no locals when deleting %R", name);
+                goto error;
+            }
+            if (_PyAnota_CheckWriteMember(tstate, ns, name) < 0) {
                 goto error;
             }
             err = PyObject_DelItem(ns, name);
@@ -2903,6 +3016,10 @@ main_loop:
             PyObject *name = GETITEM(names, oparg);
             PyObject *owner = POP();
             int err;
+            if (_PyAnota_CheckWriteMember(tstate, owner, name) < 0) {
+                Py_DECREF(owner);
+                goto error;
+            }
             err = PyObject_SetAttr(owner, name, (PyObject *)NULL);
             Py_DECREF(owner);
             if (err != 0)
@@ -2914,6 +3031,10 @@ main_loop:
             PyObject *name = GETITEM(names, oparg);
             PyObject *v = POP();
             int err;
+            if (_PyAnota_CheckWriteMember(tstate, f->f_globals, name) < 0) {
+                Py_DECREF(v);
+                goto error;
+            }
             err = PyDict_SetItem(f->f_globals, name, v);
             Py_DECREF(v);
             if (err != 0)
@@ -2924,6 +3045,9 @@ main_loop:
         case TARGET(DELETE_GLOBAL): {
             PyObject *name = GETITEM(names, oparg);
             int err;
+            if (_PyAnota_CheckWriteMember(tstate, f->f_globals, name) < 0) {
+                goto error;
+            }
             err = PyDict_DelItem(f->f_globals, name);
             if (err != 0) {
                 if (_PyErr_ExceptionMatches(tstate, PyExc_KeyError)) {
@@ -3022,6 +3146,10 @@ main_loop:
                         OPCACHE_STAT_GLOBAL_HIT();
                         assert(ptr != NULL);
                         Py_INCREF(ptr);
+                        if (_PyAnota_CheckReadObject(tstate, ptr) < 0) {
+                            Py_DECREF(ptr);
+                            goto error;
+                        }
                         PUSH(ptr);
                         DISPATCH();
                     }
@@ -3096,6 +3224,9 @@ main_loop:
         case TARGET(DELETE_FAST): {
             PyObject *v = GETLOCAL(oparg);
             if (v != NULL) {
+                if (_PyAnota_CheckWriteObject(tstate, v) < 0) {
+                    goto error;
+                }
                 SETLOCAL(oparg, NULL);
                 DISPATCH();
             }
@@ -3111,6 +3242,9 @@ main_loop:
             PyObject *cell = freevars[oparg];
             PyObject *oldobj = PyCell_GET(cell);
             if (oldobj != NULL) {
+                if (_PyAnota_CheckWriteObject(tstate, oldobj) < 0) {
+                    goto error;
+                }
                 PyCell_SET(cell, NULL);
                 Py_DECREF(oldobj);
                 DISPATCH();
@@ -3161,6 +3295,10 @@ main_loop:
                 }
                 Py_INCREF(value);
             }
+            if (_PyAnota_CheckReadObject(tstate, value) < 0) {
+                Py_DECREF(value);
+                goto error;
+            }
             PUSH(value);
             DISPATCH();
         }
@@ -3185,6 +3323,10 @@ main_loop:
             PyObject *v = POP();
             PyObject *cell = freevars[oparg];
             PyObject *oldobj = PyCell_GET(cell);
+            if (_PyAnota_CheckWriteObject(tstate, v) < 0) {
+                Py_DECREF(v);
+                goto error;
+            }
             PyCell_SET(cell, v);
             Py_XDECREF(oldobj);
             DISPATCH();
@@ -3246,6 +3388,10 @@ main_loop:
         case TARGET(LIST_EXTEND): {
             PyObject *iterable = POP();
             PyObject *list = PEEK(oparg);
+            if (_PyAnota_CheckWriteObject(tstate, list) < 0) {
+                Py_DECREF(iterable);
+                goto error;
+            }
             PyObject *none_val = _PyList_Extend((PyListObject *)list, iterable);
             if (none_val == NULL) {
                 if (_PyErr_ExceptionMatches(tstate, PyExc_TypeError) &&
@@ -3267,6 +3413,10 @@ main_loop:
         case TARGET(SET_UPDATE): {
             PyObject *iterable = POP();
             PyObject *set = PEEK(oparg);
+            if (_PyAnota_CheckWriteObject(tstate, set) < 0) {
+                Py_DECREF(iterable);
+                goto error;
+            }
             int err = _PySet_Update(set, iterable);
             Py_DECREF(iterable);
             if (err < 0) {
@@ -3415,6 +3565,10 @@ main_loop:
         case TARGET(DICT_UPDATE): {
             PyObject *update = POP();
             PyObject *dict = PEEK(oparg);
+            if (_PyAnota_CheckWriteObject(tstate, dict) < 0) {
+                Py_DECREF(update);
+                goto error;
+            }
             if (PyDict_Update(dict, update) < 0) {
                 if (_PyErr_ExceptionMatches(tstate, PyExc_AttributeError)) {
                     _PyErr_Format(tstate, PyExc_TypeError,
@@ -3431,6 +3585,10 @@ main_loop:
         case TARGET(DICT_MERGE): {
             PyObject *update = POP();
             PyObject *dict = PEEK(oparg);
+            if (_PyAnota_CheckWriteObject(tstate, dict) < 0) {
+                Py_DECREF(update);
+                goto error;
+            }
 
             if (_PyDict_MergeEx(dict, update, 2) < 0) {
                 format_kwargs_error(tstate, PEEK(2 + oparg), update);
@@ -3450,6 +3608,11 @@ main_loop:
             STACK_SHRINK(2);
             map = PEEK(oparg);                      /* dict */
             assert(PyDict_CheckExact(map));
+            if (_PyAnota_CheckWriteMember(tstate, map, key) < 0) {
+                Py_DECREF(value);
+                Py_DECREF(key);
+                goto error;
+            }
             err = PyDict_SetItem(map, key, value);  /* map[key] = value */
             Py_DECREF(value);
             Py_DECREF(key);
@@ -4183,6 +4346,9 @@ main_loop:
             PyObject *name = GETITEM(names, oparg);
             PyObject *obj = TOP();
             PyObject *meth = NULL;
+            if (_PyAnota_CheckReadMember(tstate, obj, name) < 0) {
+                goto error;
+            }
 
             int meth_found = _PyObject_GetMethod(obj, name, &meth);
 
@@ -5944,6 +6110,7 @@ call_function(PyThreadState *tstate,
     PyObject **pfunc = (*pp_stack) - oparg - 1;
     PyObject *func = *pfunc;
     PyObject *x, *w;
+    PyObject *taint_sources;
     if (_PyAnota_CheckExecObject(tstate, func) < 0) {
         while ((*pp_stack) > pfunc) {
             w = EXT_POP(*pp_stack);
@@ -5956,9 +6123,9 @@ call_function(PyThreadState *tstate,
     PyObject **stack = (*pp_stack) - nargs - nkwargs;
 
     /* ANOTA_TAINT: check taint policy for vectorcall. */
-    int taint_found = _PyAnotaTaint_CheckVectorcall(
+    taint_sources = _PyAnotaTaint_CheckVectorcall(
         tstate, func, stack, nargs, nkwargs, kwnames);
-    if (taint_found < 0) {
+    if (taint_sources == NULL) {
         while ((*pp_stack) > pfunc) {
             w = EXT_POP(*pp_stack);
             Py_DECREF(w);
@@ -5974,8 +6141,9 @@ call_function(PyThreadState *tstate,
     }
 
     if (x != NULL) {
-        _PyAnotaTaint_PostCall(func, x, taint_found);
+        _PyAnotaTaint_PostCall(func, x, taint_sources);
     }
+    Py_DECREF(taint_sources);
 
     assert((x != NULL) ^ (_PyErr_Occurred(tstate) != NULL));
 
@@ -5996,6 +6164,7 @@ do_call_core(PyThreadState *tstate,
              PyObject *kwdict)
 {
     PyObject *result;
+    PyObject *taint_sources;
 
     /* ANOTA_WATCH execute check for callables invoked via CALL_FUNCTION_EX. */
     if (_PyAnota_CheckExecObject(tstate, func) < 0) {
@@ -6003,20 +6172,21 @@ do_call_core(PyThreadState *tstate,
     }
 
     /* ANOTA_TAINT: check taint policy for CALL_FUNCTION_EX-style calls. */
-    int taint_found = _PyAnotaTaint_CheckTupleDictCall(
+    taint_sources = _PyAnotaTaint_CheckTupleDictCall(
             tstate,
             func,
             callargs,
             kwdict);
-    if (taint_found < 0) {
+    if (taint_sources == NULL) {
         return NULL;
     }
 
     if (PyCFunction_CheckExact(func) || PyCMethod_CheckExact(func)) {
         C_TRACE(result, PyObject_Call(func, callargs, kwdict));
         if (result != NULL) {
-            _PyAnotaTaint_PostCall(func, result, taint_found);
+            _PyAnotaTaint_PostCall(func, result, taint_sources);
         }
+        Py_DECREF(taint_sources);
         return result;
     }
     else if (Py_IS_TYPE(func, &PyMethodDescr_Type)) {
@@ -6041,16 +6211,18 @@ do_call_core(PyThreadState *tstate,
                                     nargs - 1,
                                     kwdict));
             if (result != NULL) {
-                _PyAnotaTaint_PostCall(func, result, taint_found);
+                _PyAnotaTaint_PostCall(func, result, taint_sources);
             }
             Py_DECREF(func);
+            Py_DECREF(taint_sources);
             return result;
         }
     }
     result = PyObject_Call(func, callargs, kwdict);
     if (result != NULL) {
-        _PyAnotaTaint_PostCall(func, result, taint_found);
+        _PyAnotaTaint_PostCall(func, result, taint_sources);
     }
+    Py_DECREF(taint_sources);
     return result;
 }
 

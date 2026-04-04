@@ -40,6 +40,7 @@ OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 #define PY_SSIZE_T_CLEAN
 #include "Python.h"
+#include "anota_taint.h"
 #include "pycore_abstract.h"      // _PyIndex_Check()
 #include "pycore_atomic_funcs.h"  // _Py_atomic_size_get()
 #include "pycore_bytes_methods.h" // _Py_bytes_lower()
@@ -2300,13 +2301,21 @@ PyUnicode_FromWideChar(const wchar_t *u, Py_ssize_t size)
 PyObject *
 PyUnicode_FromStringAndSize(const char *u, Py_ssize_t size)
 {
+    PyObject *result;
+
     if (size < 0) {
         PyErr_SetString(PyExc_SystemError,
                         "Negative size passed to PyUnicode_FromStringAndSize");
         return NULL;
     }
     if (u != NULL) {
-        return PyUnicode_DecodeUTF8Stateful(u, size, NULL, NULL);
+        result = PyUnicode_DecodeUTF8Stateful(u, size, NULL, NULL);
+        if (result != NULL &&
+            _PyAnotaTaint_ImportBuffer(result, u, size) < 0) {
+            Py_DECREF(result);
+            return NULL;
+        }
+        return result;
     }
     else {
         if (size > 0) {
@@ -2324,11 +2333,19 @@ PyObject *
 PyUnicode_FromString(const char *u)
 {
     size_t size = strlen(u);
+    PyObject *result;
+
     if (size > PY_SSIZE_T_MAX) {
         PyErr_SetString(PyExc_OverflowError, "input too long");
         return NULL;
     }
-    return PyUnicode_DecodeUTF8Stateful(u, (Py_ssize_t)size, NULL, NULL);
+    result = PyUnicode_DecodeUTF8Stateful(u, (Py_ssize_t)size, NULL, NULL);
+    if (result != NULL &&
+        _PyAnotaTaint_ImportBuffer(result, u, (Py_ssize_t)size) < 0) {
+        Py_DECREF(result);
+        return NULL;
+    }
+    return result;
 }
 
 
@@ -4256,6 +4273,12 @@ PyUnicode_AsUTF8AndSize(PyObject *unicode, Py_ssize_t *psize)
 
     if (psize)
         *psize = PyUnicode_UTF8_LENGTH(unicode);
+    if (_PyAnotaTaint_ExportBuffer(
+            unicode,
+            (void *)PyUnicode_UTF8(unicode),
+            PyUnicode_UTF8_LENGTH(unicode)) < 0) {
+        return NULL;
+    }
     return PyUnicode_UTF8(unicode);
 }
 

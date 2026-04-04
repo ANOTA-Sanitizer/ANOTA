@@ -83,7 +83,7 @@ typedef struct _typeobject PyTypeObject;
 
 #define PyObject_HEAD_INIT(type)        \
     { _PyObject_EXTRA_INIT              \
-    1, type },
+    1, type, 0 },
 
 #define PyVarObject_HEAD_INIT(type, size)       \
     { PyObject_HEAD_INIT(type) size },
@@ -106,6 +106,7 @@ typedef struct _object {
     _PyObject_HEAD_EXTRA
     Py_ssize_t ob_refcnt;
     PyTypeObject *ob_type;
+    Py_ssize_t ob_anota_taint_id;
 } PyObject;
 
 /* Cast argument to PyObject* type. */

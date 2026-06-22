@@ -3,6 +3,8 @@ import re
 import glob
 from typing import List, Dict, Any, Optional
 from logic_engine.utils.logger import audit_logger
+from logic_engine.utils.agentic_prober import AgenticProber
+from logic_engine.knowledge_scanner import StructuralIndex
 
 class CodebaseScanner:
     """
@@ -10,11 +12,13 @@ class CodebaseScanner:
     Uses RAG (Retrieval-Augmented Generation) to enrich findings with knowledge from an Obsidian vault.
     """
 
-    def __init__(self, target_path: str, knowledge_base_path: str):
+    def __init__(self, target_path: str, knowledge_base_path: str, blackboard: Optional[Any] = None):
         self.target_path = os.path.abspath(target_path)
         self.knowledge_base_path = os.path.abspath(knowledge_base_path)
+        self.blackboard = blackboard
         self.behaviors_path = os.path.join(self.knowledge_base_path, "behaviors")
         self.files_path = os.path.join(self.knowledge_base_path, "files")
+        self.prober = AgenticProber()
         
         # Common web extensions
         self.entrypoint_extensions = {'.php', '.js', '.py', '.html', '.asp', '.jsp', '.rb', '.go', '.java'}
@@ -55,7 +59,7 @@ class CodebaseScanner:
             "bac": "Bac"
         }
 
-    def scan(self) -> Dict[str, Any]:
+    async def scan(self, knowledge_index: Optional[StructuralIndex] = None) -> Dict[str, Any]:
         """Performs the full scan of the target directory."""
         audit_logger.log_event("codebase_scanner", "scan_start", input_data={"path": self.target_path})
         
@@ -64,14 +68,19 @@ class CodebaseScanner:
             "technical_context": {},
             "attack_surface": []
         }
-
+        
         if not os.path.exists(self.target_path):
             audit_logger.log_event("codebase_scanner", "scan_error", error=f"Target path {self.target_path} does not exist.")
             return results
-
+        
         for root, _, files in os.walk(self.target_path):
             for file in files:
                 file_path = os.path.join(root, file)
+                real_file_path = os.path.realpath(file_path)
+                
+                if not real_file_path.startswith(os.path.realpath(self.target_path)):
+                    continue
+
                 rel_path = os.path.relpath(file_path, self.target_path)
                 ext = os.path.splitext(file)[1].lower()
 
@@ -79,24 +88,25 @@ class CodebaseScanner:
                 if ext in self.entrypoint_extensions:
                     entrypoint = {"path": rel_path, "type": ext.lstrip('.')}
                     # RAG enrichment: look for file knowledge
-                    file_knowledge = self._get_file_knowledge(rel_path)
-                    if file_knowledge:
-                        entrypoint["knowledge"] = file_knowledge
+                    if knowledge_index:
+                        file_structure = knowledge_index.get_file_structure(f"files/{rel_path.replace('/', '_').replace('.', '_')}.md")
+                        if file_structure and file_structure.get("akus"):
+                            entrypoint["knowledge"] = file_structure["akus"]
                     results["entrypoints"].append(entrypoint)
 
                 # 2. Extract Technical Context & Attack Surface
-                self._analyze_file(file_path, rel_path, results)
+                await self._analyze_file(file_path, rel_path, results, knowledge_index)
 
         audit_logger.log_event("codebase_scanner", "scan_complete", output_data=results)
         return results
 
-    def _analyze_file(self, full_path: str, rel_path: str, results: Dict[str, Any]):
+    async def _analyze_file(self, full_path: str, rel_path: str, results: Dict[str, Any], knowledge_index: Optional[StructuralIndex] = None):
         """Analyzes a single file for context and vulnerabilities."""
         try:
             with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
 
-            # Check for technical context
+            # 1. Check for technical context
             for key, config in self.context_patterns.items():
                 for pattern in config["patterns"]:
                     if re.search(pattern, content, re.IGNORECASE):
@@ -105,38 +115,86 @@ class CodebaseScanner:
                         results["technical_context"][key] = found_val
                         break
 
-            # Check for attack surface
+            # 2. Check for attack surface
             attack_patterns = {
                 "user_input": [r"\$_GET", r"\$_POST", r"\$_REQUEST"],
                 "sql_injection": [r"query\(", r"mysqli_query\(", r"execute\("],
                 "file_inclusion": [r"file_get_contents\(", r"include\(", r"require\("],
                 "command_injection": [r"exec\(", r"system\(", r"passthru\(", r"shell_exec\("],
-                "xss": [r"echo\s+['\"]<\s*script", r"print\s+['\"]<\s*script"], # simple xss
+                "xss": [r"echo\s+['\"]<\s*script", r"print\s+['\"]<\s*script", r"document\.write\(", r"innerHTML"],
+                "csrf": [r"csrf_token", r"anti_csrf", r"token_verify"],
+                "authbypass": [r"auth_check", r"login_verify", r"session_validate"],
+                "brute": [r"login_attempt", r"password_check", r"auth_retry"],
+                "captcha": [r"captcha_verify", r"google_recaptcha", r"captcha_check"],
+                "cryptography": [r"md5\(", r"sha1\(", r"aes_decrypt", r"openssl_"],
+                "csp": [r"Content-Security-Policy", r"csp_header"],
+                "open_redirect": [r"header\(.*Location:.*", r"redirect\(.*"],
+                "javascript": [r"eval\(", r"setTimeout\(.*string", r"setInterval\(.*string"],
+                "upload": [r"move_uploaded_file\(", r"$_FILES"],
+                "weak_id": [r"id=\d+", r"user_id=\d+"],
+                "bac": [r"access_control", r"permission_check"],
             }
+
+            file_findings = []
 
             for area, patterns in attack_patterns.items():
                 for pattern in patterns:
                     matches = re.finditer(pattern, content)
                     for match in matches:
+                        line_num = content.count('\n', 0, match.start()) + 1
                         finding = {
                             "file": rel_path,
                             "type": area,
-                            "line": content.count('\n', 0, match.start()) + 1,
-                            "snippet": match.group().strip()
+                            "line_range": [line_num, line_num],
+                            "snippet": match.group().strip(),
+                            "method": "static"
                         }
                         
                         # RAG enrichment: correlate with behaviors
-                        behavior = self._correlate_with_behavior(area)
+                        behavior = await self._correlate_with_behavior(area)
                         if behavior:
                             finding["behavior_model"] = behavior
-                            
-                        results["attack_surface"].append(finding)
+                        
+                        file_findings.append(finding)
                         break # One match per area per file is enough for a baseline
+
+            # 3. Agentic Verification
+            if file_findings:
+                # Extract unique areas found in this file
+                found_areas = list(set(f["type"] for f in file_findings))
+                
+                # Get agentic findings
+                agentic_findings = await self.prober.probe_file_for_vulnerabilities(
+                    full_path,
+                    found_areas,
+                    context=results["technical_context"]
+                )
+
+                for af in agentic_findings:
+                    # Add agentic findings to file_findings
+                    # We use a simple heuristic for deduplication: type + line_range
+                    if not any(f["type"] == af["type"] and f["line_range"] == af["line_range"] for f in file_findings):
+                        af["file"] = rel_path
+                        af["method"] = "agentic"
+                        file_findings.append(af)
+
+            # 4. Knowledge Correlation
+            if knowledge_index:
+                structure = knowledge_index.get_file_structure(rel_path)
+                if structure and structure.get("akus"):
+                    for aku in structure["akus"]:
+                        if f"file: {rel_path}" in aku.get("source", ""):
+                            for finding in file_findings:
+                                if "knowledge_context" not in finding:
+                                    finding["knowledge_context"] = []
+                                finding["knowledge_context"].append(aku)
+
+            results["attack_surface"].extend(file_findings)
 
         except Exception as e:
             audit_logger.log_event("codebase_scanner", "file_analysis_error", input_data={"file": rel_path}, error=str(e))
 
-    def _get_file_knowledge(self, rel_path: str) -> Optional[str]:
+    async def _get_file_knowledge(self, rel_path: str) -> Optional[str]:
         """Attempts to find knowledge for a file in the Obsidian files directory."""
         # Convert rel_path like 'vulnerabilities/api/src/User.php' 
         # to 'vulnerabilities_api_src_User_php.md' style if it follows knowledge pattern
@@ -166,8 +224,8 @@ class CodebaseScanner:
                 pass
                 
         return None
-
-    def _correlate_with_behavior(self, attack_type: str) -> Optional[str]:
+    
+    async def _correlate_with_behavior(self, attack_type: str) -> Optional[str]:
         """Finds relevant behavior models in the Obsidian behaviors directory."""
         keyword = self.attack_type_to_keyword.get(attack_type)
         if not keyword:
@@ -195,4 +253,3 @@ if __name__ == "__main__":
     
     scanner = CodebaseScanner(args.target, args.rules)
     print(scanner.scan())
-

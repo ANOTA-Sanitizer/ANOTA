@@ -33,7 +33,10 @@ class PHPRunner:
             run_env.update(env)
         
         run_env["ANOTA_TELEMETRY_TARGET"] = temp_path
-
+        # Also provide the observer socket path if it's not already set
+        if "ANOTA_OBSERVER_SOCKET" not in run_env:
+            run_env["ANOTA_OBSERVER_SOCKET"] = "/tmp/anota_telemetry.sock"
+        
         # Command to run PHP with auto-prepend
         cmd = [
             self.php_bin,
@@ -41,7 +44,7 @@ class PHPRunner:
             "-d", "xdebug.mode=coverage",
             script_path
         ] + args
-
+        
         try:
             result = subprocess.run(
                 cmd,

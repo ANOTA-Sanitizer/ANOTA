@@ -37,11 +37,23 @@ register_shutdown_function(function() {
         "state" => $state
     ];
 
-    // Emit to a file if requested via env, otherwise fallback to stdout with markers
+    // 1. Try sending to socket if requested via env
+    $socket_path = getenv("ANOTA_OBSERVER_SOCKET");
+    if ($socket_path) {
+        $fp = @stream_socket_client("unix://$socket_path", $errno, $errstr, 1);
+        if ($fp) {
+            fwrite($fp, json_encode($telemetry));
+            fclose($fp);
+            return; // Success
+        }
+    }
+
+    // 2. Fallback to file if requested via env
     $target = getenv("ANOTA_TELEMETRY_TARGET");
     if ($target && $target !== "stdout") {
         file_put_contents($target, json_encode($telemetry));
     } else {
+        // 3. Fallback to stdout with markers
         echo "\n---ANOTA_TELEMETRY_START---\n";
         echo json_encode($telemetry);
         echo "\n---ANOTA_TELEMETRY_END---\n";

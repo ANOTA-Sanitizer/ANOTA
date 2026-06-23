@@ -1,7 +1,10 @@
+import pytest
 from logic_engine.knowledge_scanner import KnowledgeScanner
 import os
+import asyncio
 
-def test_qbrain_scan():
+@pytest.mark.asyncio
+async def test_qbrain_scan():
     # Path to the real obsidian vault
     vault_path = os.path.abspath("../Qbrain/obsidian_vault")
     print(f"Scanning vault: {vault_path}")
@@ -9,9 +12,9 @@ def test_qbrain_scan():
     if not os.path.exists(vault_path):
         print(f"Error: Vault path {vault_path} does not exist.")
         return
-
+    
     scanner = KnowledgeScanner(vault_path=vault_path)
-    knowledge_map = scanner.scan_vault()
+    knowledge_map = await scanner.scan_vault()
     
     print(f"Successfully scanned {len(knowledge_map)} files.")
     
@@ -30,5 +33,3 @@ def test_qbrain_scan():
     else:
         print("\nLayer 1 scan of Qbrain/obsidian_vault successful.")
 
-if __name__ == "__main__":
-    test_qbrain_scan()

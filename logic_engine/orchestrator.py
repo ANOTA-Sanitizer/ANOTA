@@ -1,5 +1,6 @@
+import os
+import asyncio
 import json
-from datetime import datetime
 from typing import TypedDict, Annotated, List, Dict, Any, Optional
 from langgraph.graph import StateGraph, END
 from logic_engine.blackboard import blackboard
@@ -10,8 +11,8 @@ from logic_engine.agentic_codebase_scanner import AgenticCodebaseScanner
 from logic_engine.executor import Executor
 from logic_engine.utils.logger import logger
 from logic_engine.knowledge_scanner import StructuralIndex
-import os
-import asyncio
+from logic_engine.scanners.config_scanner import AgenticConfigScanner
+from logic_engine.scanners.setup_orchestrator import TargetSetupOrchestrator
 
 class AgentState(TypedDict):
     task: str
@@ -32,6 +33,7 @@ class AgentState(TypedDict):
     observation: Dict[str, Any]
     next_action: str
     checkpoint: Optional[Dict[str, Any]]
+    setup_completed: bool
 
 class MockMemory:
     def __init__(self, repo_path):
@@ -55,6 +57,8 @@ class AgentOrchestrator:
         
         self.scanner = AgenticKnowledgeScanner(self.knowledge_base_path, prefix=self.project_name)
         self.codebase_scanner = AgenticCodebaseScanner(self.repo_path, self.knowledge_base_path, self.blackboard, prefix=self.project_name)
+        self.config_scanner = AgenticConfigScanner(self.repo_path)
+        self.setup_orchestrator = TargetSetupOrchestrator(self.repo_path)
         self.observer = Observer()
         self.reasoner = ReasoningEngine(self.knowledge_base_path)
         self.executor = Executor()
@@ -84,17 +88,54 @@ class AgentOrchestrator:
             logger.info("    [!] Blackboard Cleared")
 
     def _routing_node(self, state: AgentState) -> AgentState:
-        """Decide whether to start discovery or skip to challenge generation."""
-        if state.get("context", {}).get("discovered_entrypoints") is not None:
-            logger.info("    [#] Resuming from checkpoint: Skipping Static Discovery.")
-            return state
+        """Decide the initial entry point of the graph."""
         return state
 
     def _route_from_start(self, state: AgentState) -> str:
         """Routing decision for the entry point."""
-        if state.get("context", {}).get("discovered_entrypoints") is not None:
-            return "skip_discovery"
-        return "start_discovery"
+        if state.get("setup_completed"):
+            return "check_discovery"
+        return "setup"
+
+    async def _setup_node(self, state: AgentState) -> AgentState:
+        logger.info("Running Setup Phase...")
+        
+        # 1. Perform target setup (Docker/Local PHP)
+        setup_results = await self.setup_orchestrator.setup()
+        logger.info(f"Setup result: {setup_results['status']} using {setup_results['method']}")
+        
+        if setup_results["status"] == "failed":
+            logger.error(f"Setup failed: {setup_results['error']}")
+
+        # 2. Discover configuration (SQL, etc.)
+        logger.info("Discovering target configuration...")
+        config_results = await self.config_scanner.scan()
+        
+        # 3. Update State
+        state["setup_completed"] = True
+        state["context"]["setup_results"] = setup_results
+        state["context"]["target_config"] = config_results
+        
+        # Save checkpoint immediately after setup
+        self._save_checkpoint(state)
+        
+        return state
+
+    def _check_discovery_node(self, state: AgentState) -> AgentState:
+        logger.info("Checking discovery status...")
+        return state
+
+    def _route_from_setup(self, state: AgentState) -> str:
+        """Routing decision after setup."""
+        if state.get("context", {}).get("discovered_entrypoints"):
+            return "challenge_generation"
+        return "static_discovery"
+
+    def _route_from_check_discovery(self, state: AgentState) -> str:
+        """Routing decision after checking discovery."""
+        if state.get("context", {}).get("discovered_entrypoints"):
+            return "challenge_generation"
+        return "static_discovery"
 
     async def _static_discovery_node(self, state: AgentState) -> AgentState:
         logger.info("Running Static Discovery...")
@@ -103,40 +144,37 @@ class AgentOrchestrator:
         # 1. Build a structural index of the vault first
         logger.info("Building initial vault structural index...")
         knowledge_map = await self.scanner.scan_vault()
- 
+        
         # 2. Scan Codebase with the structural index
-        # This will find entrypoints and potentially enrich findings IF the index has AKUs.
-        # But the index doesn't have AKUs yet.
         logger.info("Scanning Codebase...")
         scan_results = await self.codebase_scanner.scan(knowledge_index=knowledge_map)
- 
+        
         # 3. Now enrich the vault with AKUs for the discovered entrypoints
         logger.info("Starting Agentic Knowledge Scan to enrich vault...")
         knowledge_map = await self.scanner.scan_relevant_vault(scan_results["entrypoints"])
- 
+        
         # 4. Perform Agentic Codebase Scanning (Probe-and-Synthesize)
         logger.info("Performing Agentic Codebase Scanning (Probe-and-Synthesize)...")
         code_facts = await self.codebase_scanner.scan_and_synthesize(knowledge_index=knowledge_map, scan_results=scan_results)
- 
+        
         # Populate Blackboard
         self.blackboard.add_fact("discovered_entrypoints", scan_results["entrypoints"])
         self.blackboard.add_fact("technical_context", scan_results["technical_context"])
         self.blackboard.add_fact("attack_surface", scan_results["attack_surface"])
         self.blackboard.add_fact("knowledge_map", knowledge_map)
         self.blackboard.add_fact("code_facts", code_facts)
- 
+        
         # Update State
         state["context"]["discovered_entrypoints"] = scan_results["entrypoints"]
         state["context"]["technical_context"] = scan_results["technical_context"]
         state["context"]["attack_surface"] = scan_results["attack_surface"] + code_facts
         state["context"]["knowledge_map"] = knowledge_map
         state["findings"] = code_facts
-
+        
         # Save checkpoint immediately after discovery to allow resumption
         self._save_checkpoint(state)
- 
+        
         return state
-
 
     def _challenge_generation_node(self, state: AgentState) -> AgentState:
         logger.info("Generating Challenges...")
@@ -182,6 +220,7 @@ class AgentOrchestrator:
         logger.info("Executor: Running payload...")
         idx = state.get("current_challenge_index", 0)
         challenges = state.get("challenges", [])
+        target_config = state.get("context", {}).get("target_config")
 
         if idx < len(challenges):
             challenge = challenges[idx]
@@ -190,7 +229,7 @@ class AgentOrchestrator:
             # Record start time to ensure we get the telemetry from THIS execution
             start_time = datetime.now()
             
-            result = await self.executor.run_payload(challenge, self.codebase_scanner)
+            result = await self.executor.run_payload(challenge, self.codebase_scanner, target_config=target_config)
             
             # Check if the Observer captured anything in the blackboard during this run
             observation_entry = self.blackboard.get_latest_fact_entry("last_observation")
@@ -313,13 +352,16 @@ class AgentOrchestrator:
             "current_challenge_index": 0,
             "observation": {},
             "next_action": "",
-            "checkpoint": None
+            "checkpoint": None,
+            "setup_completed": False
         }
 
     def _build_graph(self):
         workflow = StateGraph(AgentState)
 
         workflow.add_node("routing_node", self._routing_node)
+        workflow.add_node("setup", self._setup_node)
+        workflow.add_node("check_discovery", self._check_discovery_node)
         workflow.add_node("static_discovery", self._static_discovery_node)
         workflow.add_node("challenge_generation", self._challenge_generation_node)
         workflow.add_node("requester", self._requester_node)
@@ -332,8 +374,17 @@ class AgentOrchestrator:
             "routing_node",
             self._route_from_start,
             {
-                "start_discovery": "static_discovery",
-                "skip_discovery": "challenge_generation"
+                "setup": "setup",
+                "check_discovery": "check_discovery"
+            }
+        )
+        workflow.add_edge("setup", "check_discovery")
+        workflow.add_conditional_edges(
+            "check_discovery",
+            self._route_from_check_discovery,
+            {
+                "static_discovery": "static_discovery",
+                "challenge_generation": "challenge_generation"
             }
         )
         workflow.add_edge("static_discovery", "challenge_generation")
@@ -341,7 +392,6 @@ class AgentOrchestrator:
         workflow.add_edge("requester", "executor")
         workflow.add_edge("executor", "observer")
         workflow.add_edge("observer", "reasoning")
-
         workflow.add_conditional_edges(
             "reasoning",
             self._should_continue,
@@ -352,4 +402,5 @@ class AgentOrchestrator:
         )
 
         return workflow.compile()
+
 

@@ -33,7 +33,7 @@ class Executor:
         self.payload_generator = PayloadGenerator()
         self.base_url = base_url.rstrip('/')
 
-    async def run_payload(self, challenge: Dict[str, Any], codebase: Any) -> Dict[str, Any]:
+    async def run_payload(self, challenge: Dict[str, Any], codebase: Any, target_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Executes a payload against the target.
         """
@@ -43,7 +43,7 @@ class Executor:
         
         if not target_str:
             return {"status": "error", "message": "No target specified in challenge"}
-
+        
         # 1. Parse target (e.g., "vulnerabilities/api/index.php:42")
         try:
             if ":" in target_str:
@@ -54,14 +54,14 @@ class Executor:
                 line_num = None
         except ValueError:
             return {"status": "error", "message": f"Invalid target format: {target_str}"}
-
+        
         # 2. Generate Payload
         try:
             payload = await self.payload_generator.generate_payload(v_type, {
                 "file": file_rel_path,
                 "line": line_num,
                 "description": description
-            })
+            }, target_config=target_config)
             
             # If the payload is wrapped in a dict (as seen in test), extract it
             if isinstance(payload, dict) and "payload" in payload:
@@ -71,6 +71,7 @@ class Executor:
         
         if not payload:
             return {"status": "error", "message": "Generated payload is empty"}
+
 
         # 3. Execute simulation (using PHP runner to simulate a web request)
         # We create a wrapper script that sets up the environment (like $_GET) and then includes the target.

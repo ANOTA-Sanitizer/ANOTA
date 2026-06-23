@@ -14,18 +14,19 @@ class PayloadGenerator:
     def __init__(self, model_type: str = "reasoning"):
         self.llm = AgentConfig.get_llm(model_type=model_type)
 
-    async def generate_payload(self, vulnerability_type: str, target_context: Dict[str, Any]) -> str:
+    async def generate_payload(self, vulnerability_type: str, target_context: Dict[str, Any], target_config: Optional[Dict[str, Any]] = None) -> str:
         """
         Generates a payload for a given vulnerability type and target context.
         
         Args:
             vulnerability_type: The type of vulnerability (e.g., 'sql_injection', 'xss').
             target_context: Context about the target (e.g., {'file': 'login.php', 'line': 42, 'parameter': 'id'}).
+            target_config: Environmental context (e.g., {'db_type': 'mysql', 'auth_method': 'session'}).
             
         Returns:
             A string containing the payload.
         """
-        system_prompt = (
+        system_prompt_parts = [
             "You are a specialized security payload generation agent. Your task is to generate a single, "
             "highly effective payload for a specific vulnerability type and target context. "
             "\n\n"
@@ -33,7 +34,16 @@ class PayloadGenerator:
             "the vulnerability. "
             "\n\n"
             "Output MUST be ONLY the raw payload string. No explanations, no markdown, no quotes."
-        )
+        ]
+
+        if target_config:
+            system_prompt_parts.append("\n\n### Environmental Context (IMPORTANT)")
+            system_prompt_parts.append("The following environmental facts are known about the target system:")
+            for key, value in target_config.items():
+                system_prompt_parts.append(f"- {key}: {value}")
+            system_prompt_parts.append("\nUse this context to refine your payload (e.g., use MySQL syntax if the DB is MySQL).")
+
+        system_prompt = "\n".join(system_prompt_parts)
 
         user_prompt = (
             f"Vulnerability Type: {vulnerability_type}\n"

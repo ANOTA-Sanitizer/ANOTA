@@ -20,15 +20,17 @@ class AgenticProber:
     Now enhanced with context-awareness to use environmental prerequisites.
     """
 
-    def __init__(self, model_type: str = "reasoning"):
+    def __init__(self, model_type: str = "reasoning", prefix: Optional[str] = None):
         self.llm = AgentConfig.get_llm(model_type=model_type)
         self.reader = SemanticReader()
+        self.prefix = prefix
 
     async def probe_file_for_vulnerabilities(
         self, 
         file_path: str, 
         target_areas: List[str], 
-        context: Optional[Dict[str, Any]] = None
+        context: Optional[Dict[str, Any]] = None,
+        rel_path: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         Probes a file for specific types of vulnerabilities using semantic analysis.
@@ -37,6 +39,7 @@ class AgenticProber:
             file_path: Absolute path to the file.
             target_areas: List of vulnerability types to look for.
             context: Environmental context (e.g., DB type, auth requirements).
+            rel_path: Optional relative path for findings.
         """
         findings = []
         
@@ -48,10 +51,10 @@ class AgenticProber:
         except Exception as e:
             logger.error(f"Error reading file for probe: {e}")
             return []
-
+        
         if not context_snippet:
             return []
-
+        
         # Build a system prompt that incorporates the environmental context
         system_prompt_parts = [
             "You are a specialized security analysis agent. Your task is to identify potential "
@@ -63,28 +66,37 @@ class AgenticProber:
             "- 'line_range': The estimated line numbers (e.g., [10, 15])\n"
             "- 'confidence': A score from 0.0 to 1.0"
         ]
-
+        
         if context:
             system_prompt_parts.append("\n\n### Environmental Context (IMPORTANT)")
             system_prompt_parts.append("The following environmental facts are known about the target system:")
             for key, value in context.items():
                 system_prompt_parts.append(f"- {key}: {value}")
             system_prompt_parts.append("\nUse this context to refine your analysis (e.g., prioritize MySQL payloads if the DB is MySQL).")
-
+        
         system_prompt = "\n".join(system_prompt_parts)
-
+        
         user_prompt = (
             f"File: {file_path}\n"
             f"Target Areas: {', '.join(target_areas)}\n\n"
             f"Code Snippet:\n{context_snippet}\n\n"
             "Identify vulnerabilities matching the target areas. If none are found, return an empty list []."
         )
-
+        
         try:
             response = await self.llm.ainvoke([
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_prompt)
             ])
+            
+            # Log the LLM call for transparency
+            from logic_engine.utils.logger import audit_logger
+            audit_logger.log_llm_call(
+                agent_id=self.prefix or "agentic_prober",
+                component="probe_file_for_vulnerabilities",
+                prompt=user_prompt,
+                response=str(response.content) if hasattr(response, 'content') else str(response)
+            )
             
             findings_data = response.content if isinstance(response.content, list) else []
             if isinstance(response.content, str):
@@ -103,7 +115,7 @@ class AgenticProber:
                 enriched_findings = []
                 for f in findings_data:
                     if all(k in f for k in ("type", "description", "line_range", "confidence")):
-                        f["file"] = file_path
+                        f["file"] = rel_path if rel_path else file_path
                         enriched_findings.append(f)
                 return enriched_findings
 
@@ -111,6 +123,7 @@ class AgenticProber:
             logger.error(f"Error probing file {file_path}: {e}")
             
         return []
+
 
     async def probe_for_context(self, file_path: str, query: str) -> str:
         """
@@ -141,6 +154,16 @@ class AgenticProber:
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_prompt)
             ])
+            
+            # Log the LLM call for transparency
+            from logic_engine.utils.logger import audit_logger
+            audit_logger.log_llm_call(
+                agent_id=self.prefix or "agentic_prober",
+                component="probe_for_context",
+                prompt=user_prompt,
+                response=str(response.content) if hasattr(response, 'content') else str(response)
+            )
+
             return response.content
         except Exception as e:
             return f"Error probing context: {e}"
@@ -178,6 +201,15 @@ class AgenticProber:
                 HumanMessage(content=user_prompt)
             ])
             
+            # Log the LLM call for transparency
+            from logic_engine.utils.logger import audit_logger
+            audit_logger.log_llm_call(
+                agent_id="agentic_knowledge_scanner",
+                component="extract_aku",
+                prompt=user_prompt,
+                response=str(response.content) if hasattr(response, 'content') else str(response)
+            )
+
             aku = response.content
             if isinstance(aku, str):
                 try:

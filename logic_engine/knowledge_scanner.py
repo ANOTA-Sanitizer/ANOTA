@@ -3,7 +3,7 @@ import re
 import glob
 import asyncio
 from typing import List, Dict, Any, Optional
-from logic_engine.utils.logger import audit_logger
+from logic_engine.utils.logger import audit_logger, logger
 from logic_engine.utils.semantic_reader import SemanticReader
 from logic_engine.utils.agentic_prober import AgenticProber
 
@@ -18,6 +18,34 @@ class StructuralIndex(dict):
 
     def get_file_structure(self, rel_path: str) -> Optional[Dict[str, Any]]:
         return self.get(rel_path)
+
+    def get_file_structure_with_prefix(self, rel_path: str, prefix: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Attempts to get file structure, trying both prefixed and non-prefixed paths."""
+        # 1. Try exact match
+        res = self.get(rel_path)
+        if res:
+            return res
+        
+        # 2. If prefix is provided, try with prefix
+        if prefix:
+            prefix_str = f"{prefix}_"
+            # If rel_path already starts with the prefix, don't add it again
+            if not rel_path.startswith(prefix_str):
+                prefixed_path = f"{prefix_str}{rel_path}"
+                res = self.get(prefixed_path)
+                if res:
+                    return res
+        
+        # 3. If prefix was provided, also try without it (in case rel_path was already prefixed)
+        if prefix:
+            prefix_str = f"{prefix}_"
+            if rel_path.startswith(prefix_str):
+                unprefixed_path = rel_path[len(prefix_str):]
+                res = self.get(unprefixed_path)
+                if res:
+                    return res
+
+        return None
 
     def find_relevant_files(self, keyword: str) -> List[str]:
         """Finds files whose names or headings might match a keyword."""
@@ -39,8 +67,9 @@ class KnowledgeScanner:
     Uses ContextManager to build a semantic model of environmental requirements.
     """
 
-    def __init__(self, vault_path: str):
+    def __init__(self, vault_path: str, prefix: Optional[str] = None):
         self.vault_path = os.path.abspath(vault_path)
+        self.prefix = prefix
         self.reader = SemanticReader()
         self.prober = AgenticProber()
         self.wiki_link_pattern = re.compile(r"\[\[([^|\]]+?)(?:\\?\|([^\]]+))?\]\]")
@@ -65,7 +94,7 @@ class KnowledgeScanner:
         # 2. Targeted Agentic Enrichment
         # We want to find AKUs (Atomic Knowledge Units) for the relevant entrypoints.
         # We'll attach these AKUs to the index.
-        print("[*] Starting targeted agentic enrichment of behavior entrypoints...")
+        logger.info(f"[*] Starting targeted agentic enrichment. Entrypoints: {entrypoints}")
         
         # Identify which rel_paths in knowledge_map correspond to behavior entrypoints
         target_rel_paths = []
@@ -74,19 +103,25 @@ class KnowledgeScanner:
             # Transform codebase path to vault relative path
             # e.g. vulnerabilities/api/index.php -> files/vulnerabilities_api_index_php.md
             v_rel_path = f"files/{e_path.replace('/', '_').replace('.', '_')}.md"
-            if index.get_file_structure(v_rel_path):
+            logger.info(f"    [>] Checking vault file: {v_rel_path}")
+            if index.get_file_structure_with_prefix(v_rel_path, self.prefix):
+                logger.info(f"    [+] Found in vault: {v_rel_path}")
                 target_rel_paths.append(v_rel_path)
+            else:
+                logger.info(f"    [-] Not found in vault: {v_rel_path}")
         
-        print(f"    [+] Targeted {len(target_rel_paths)} files for enrichment out of {len(index.files)} total files in index.")
+        logger.info(f"    [+] Targeted {len(target_rel_paths)} files for enrichment out of {len(index.files)} total files in index.")
         
-        # Enrich the index with AKUs for the target files
-        await self._agentic_enrichment(index, target_rel_paths)
+        if target_rel_paths:
+            logger.info(f"[*] Starting agentic enrichment for {len(target_rel_paths)} files...")
+            await self._agentic_enrichment(index, target_rel_paths)
         
         audit_logger.log_event("knowledge_scanner", "scan_relevant_vault_complete", output_data={
             "file_count": len(index.files), 
             "akus_count": sum(len(index.get_file_structure(fp).get("akus", [])) for fp in index.files)
         })
         return index
+
 
     async def scan_vault(self) -> StructuralIndex:
         """Performs a full scan of the knowledge vault."""
@@ -160,7 +195,12 @@ class KnowledgeScanner:
                 if aku:
                     # Ensure the AKU has its source context
                     if "source" not in aku:
-                         aku["source"] = f"file: {rel_path} | heading: {heading['text']}"
+                        folder = os.path.dirname(rel_path)
+                        parts = [f"file: {rel_path}"]
+                        if folder and folder != ".":
+                            parts.append(f"folder: {folder}")
+                        parts.append(f"heading: {heading['text']}")
+                        aku["source"] = " | ".join(parts)
                     structure["akus"].append(aku)
 
 # Global instance

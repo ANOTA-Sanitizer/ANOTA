@@ -1,7 +1,7 @@
 import json
 import os
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Callable
 from logic_engine.utils.logger import audit_logger
 
 class Blackboard:
@@ -13,7 +13,21 @@ class Blackboard:
             "verified_findings": [],
             "current_context": {}
         }
+        self.observers: List[Callable[[str, Any], None]] = []
         self._load()
+
+    def register_observer(self, callback: Callable[[str, Any], None]):
+        """Registers a callback to be notified of state changes."""
+        self.observers.append(callback)
+
+    def _notify(self, event_type: str, data: Any):
+        """Notifies all registered observers of a state change."""
+        for observer in self.observers:
+            try:
+                observer(event_type, data)
+            except Exception:
+                # Observers should not break the main flow
+                pass
 
     def _load(self):
         if os.path.exists(self.filepath):
@@ -49,6 +63,7 @@ class Blackboard:
             
         self.state["facts"].append(fact_entry)
         self._save()
+        self._notify("fact_added", fact_entry)
 
     def add_hypothesis(self, hypothesis: Any, metadata: Optional[Dict[str, Any]] = None):
         """Adds a new hypothesis to the blackboard."""
@@ -61,6 +76,7 @@ class Blackboard:
             hypothesis_entry["metadata"] = metadata
         self.state["hypotheses"].append(hypothesis_entry)
         self._save()
+        self._notify("hypothesis_added", hypothesis_entry)
 
     def add_verified_finding(self, finding: Any, metadata: Optional[Dict[str, Any]] = None):
         """Adds a verified finding to the blackboard."""
@@ -72,16 +88,18 @@ class Blackboard:
             finding_entry.update(finding)
         else:
             finding_entry["content"] = finding
-
+        
         if metadata:
             finding_entry["metadata"] = metadata
         self.state["verified_findings"].append(finding_entry)
         self._save()
+        self._notify("finding_verified", finding_entry)
 
     def update_context(self, key, value):
         """Updates the current context."""
         self.state["current_context"][key] = value
         self._save()
+        self._notify("context_updated", {"key": key, "value": value})
 
     def get_all(self):
         """Returns the full blackboard state."""
@@ -125,6 +143,8 @@ class Blackboard:
             "current_context": {}
         }
         self._save()
+        self._notify("blackboard_cleared", None)
 
 # Global instance
 blackboard = Blackboard()
+

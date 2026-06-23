@@ -35,11 +35,9 @@ class AgentAuditLogger:
                 logger.error(f"Error pruning log file {filepath}: {e}")
 
     def log_event(self, agent_id: str, action: str, input_data: Any = None, output_data: Any = None, error: Union[Exception, str] = None) -> str:
-        """
-        Logs a single agent event as a JSON file for a complete audit trail.
-        """
+        """Logs a single agent event as a JSON file for a complete audit trail."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        filename = f"{agent_id}_{timestamp}.json"
+        filename = f"{agent_id}_{action}_{timestamp}.json"
         filepath = os.path.join(self.log_dir, filename)
 
         event = {
@@ -55,6 +53,15 @@ class AgentAuditLogger:
             json.dump(event, f, indent=4)
         
         return filepath
+
+    def log_llm_call(self, agent_id: str, component: str, prompt: str, response: str) -> str:
+        """Logs an LLM call with full transparency of the component and content."""
+        return self.log_event(
+            agent_id=f"{agent_id}:{component}",
+            action="llm_call",
+            input_data={"prompt": prompt},
+            output_data={"response": response}
+        )
 
     def info(self, msg: str):
         logger.info(msg)

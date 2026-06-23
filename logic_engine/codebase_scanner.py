@@ -2,7 +2,7 @@ import os
 import re
 import glob
 from typing import List, Dict, Any, Optional
-from logic_engine.utils.logger import audit_logger
+from logic_engine.utils.logger import audit_logger, logger
 from logic_engine.utils.agentic_prober import AgenticProber
 from logic_engine.knowledge_scanner import StructuralIndex
 
@@ -12,10 +12,11 @@ class CodebaseScanner:
     Uses RAG (Retrieval-Augmented Generation) to enrich findings with knowledge from an Obsidian vault.
     """
 
-    def __init__(self, target_path: str, knowledge_base_path: str, blackboard: Optional[Any] = None):
+    def __init__(self, target_path: str, knowledge_base_path: str, blackboard: Optional[Any] = None, prefix: Optional[str] = None):
         self.target_path = os.path.abspath(target_path)
         self.knowledge_base_path = os.path.abspath(knowledge_base_path)
         self.blackboard = blackboard
+        self.prefix = prefix
         self.behaviors_path = os.path.join(self.knowledge_base_path, "behaviors")
         self.files_path = os.path.join(self.knowledge_base_path, "files")
         self.prober = AgenticProber()
@@ -83,19 +84,23 @@ class CodebaseScanner:
 
                 rel_path = os.path.relpath(file_path, self.target_path)
                 ext = os.path.splitext(file)[1].lower()
+                
+                # Debug log
+                logger.info(f"Checking file: {rel_path}, ext: {ext}")
 
                 # 1. Identify Entrypoints
                 if ext in self.entrypoint_extensions:
                     entrypoint = {"path": rel_path, "type": ext.lstrip('.')}
                     # RAG enrichment: look for file knowledge
                     if knowledge_index:
-                        file_structure = knowledge_index.get_file_structure(f"files/{rel_path.replace('/', '_').replace('.', '_')}.md")
+                        file_structure = knowledge_index.get_file_structure_with_prefix(f"files/{rel_path.replace('/', '_').replace('.', '_')}.md", self.prefix)
                         if file_structure and file_structure.get("akus"):
                             entrypoint["knowledge"] = file_structure["akus"]
-                    results["entrypoints"].append(entrypoint)
 
-                # 2. Extract Technical Context & Attack Surface
-                await self._analyze_file(file_path, rel_path, results, knowledge_index)
+                    results["entrypoints"].append(entrypoint)
+                    logger.info(f"    [+] Found entrypoint: {rel_path}")
+                    await self._analyze_file(file_path, rel_path, results, knowledge_index)
+
 
         audit_logger.log_event("codebase_scanner", "scan_complete", output_data=results)
         return results
@@ -167,8 +172,10 @@ class CodebaseScanner:
                 agentic_findings = await self.prober.probe_file_for_vulnerabilities(
                     full_path,
                     found_areas,
-                    context=results["technical_context"]
+                    context=results["technical_context"],
+                    rel_path=rel_path
                 )
+
 
                 for af in agentic_findings:
                     # Add agentic findings to file_findings
@@ -180,14 +187,17 @@ class CodebaseScanner:
 
             # 4. Knowledge Correlation
             if knowledge_index:
-                structure = knowledge_index.get_file_structure(rel_path)
+                structure = knowledge_index.get_file_structure_with_prefix(f"files/{rel_path.replace('/', '_').replace('.', '_')}.md", self.prefix)
                 if structure and structure.get("akus"):
-                    for aku in structure["akus"]:
-                        if f"file: {rel_path}" in aku.get("source", ""):
-                            for finding in file_findings:
-                                if "knowledge_context" not in finding:
-                                    finding["knowledge_context"] = []
-                                finding["knowledge_context"].append(aku)
+                        for aku in structure["akus"]:
+                            folder = os.path.dirname(rel_path)
+                            if f"file: {rel_path}" in aku.get("source", "") or (folder and folder != "." and f"folder: {folder}" in aku.get("source", "")):
+                                for finding in file_findings:
+                                    if "knowledge_context" not in finding:
+                                        finding["knowledge_context"] = []
+                                    finding["knowledge_context"].append(aku)
+
+
 
             results["attack_surface"].extend(file_findings)
 
@@ -202,6 +212,9 @@ class CodebaseScanner:
         
         # Pattern 1: direct match with underscores
         clean_name = rel_path.replace('/', '_').replace('.', '_')
+        if self.prefix:
+            clean_name = f"{self.prefix}_{clean_name}"
+            
         possible_file = os.path.join(self.files_path, f"{clean_name}.md")
         
         if os.path.exists(possible_file):
@@ -210,10 +223,13 @@ class CodebaseScanner:
                     return f.read().strip()
             except:
                 pass
-
+        
         # Pattern 2: simple filename match (e.g. login.php -> login_php.md)
         filename = os.path.basename(rel_path)
         clean_filename = filename.replace('.', '_')
+        if self.prefix:
+            clean_filename = f"{self.prefix}_{clean_filename}"
+            
         possible_file_simple = os.path.join(self.files_path, f"{clean_filename}.md")
         
         if os.path.exists(possible_file_simple):

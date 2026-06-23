@@ -103,7 +103,7 @@ require_once "{target_full_path}";
                 tmp.write(wrapper_content)
                 tmp_path = tmp.name
 
-            print(f"    [>] Running simulated payload on {target_full_path} via wrapper: {tmp_path}")
+            logger.info(f"    [>] Running simulated payload on {target_full_path} via wrapper: {tmp_path}")
             
             # Run the wrapper script
             telemetry = self.php_runner.run(tmp_path)

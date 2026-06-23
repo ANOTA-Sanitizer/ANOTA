@@ -10,6 +10,9 @@ class AgenticKnowledgeScanner(KnowledgeScanner):
     formal Markdown headings.
     """
 
+    def __init__(self, vault_path: str, prefix: Optional[str] = None):
+        super().__init__(vault_path, prefix)
+
     async def scan_with_semantic_chunking(self, target_rel_paths: List[str]) -> List[Dict[str, Any]]:
         """
         Performs a semantic scan of specified files.
@@ -47,61 +50,3 @@ class AgenticKnowledgeScanner(KnowledgeScanner):
 
         audit_logger.log_event("agentic_knowledge_scanner", "semantic_scan_complete", output_data={"akus_found": len(all_akus)})
         return all_akus
-
-    async def _get_semantic_chunks(self, content: str, rel_path: str) -> List[Dict[str, Any]]:
-        """
-        Uses the LLM to identify logically distinct semantic chunks within the text.
-        """
-        system_prompt = (
-            "You are a semantic analysis agent. Your task is to decompose a text into a list of "
-            "logically distinct, self-contained semantic chunks. Each chunk should represent a "
-            "single coherent idea, rule, or piece of information. "
-            "\n\n"
-            "Output must be a JSON list of objects, each with these keys: "
-            "- 'content': The actual text of the chunk. "
-            "- 'context': A short, descriptive summary of what this chunk is about (e.g., 'Definition of X', 'Security Rule for Y')."
-        )
-        
-        user_prompt = f"Source File: {rel_path}\n\nText to chunk:\n{content}"
-
-        try:
-            response = await self.prober.llm.ainvoke([
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ])
-            
-            raw_content = response.content if hasattr(response, 'content') else str(response)
-            
-            # Parse JSON from response
-            chunks = []
-            if "```json" in raw_content:
-                import re
-                json_match = re.search(r"```json\n(.*?)\n```", raw_content, re.DOTALL)
-                if json_match:
-                    import json
-                    chunks = json.loads(json_match.group(1))
-            else:
-                import json
-                try:
-                    chunks = json.loads(raw_content)
-                except json.JSONDecodeError:
-                    # Try to find any JSON-like structure
-                    import re
-                    json_match = re.search(r"\[.*\]", raw_content, re.DOTALL)
-                    if json_match:
-                        try:
-                            chunks = json.loads(json_match.group(0))
-                        except json.JSONDecodeError:
-                            pass
-            
-            # Validate chunks
-            valid_chunks = []
-            for c in chunks:
-                if isinstance(c, dict) and "content" in c and "context" in c:
-                    valid_chunks.append(c)
-            
-            return valid_chunks
-
-        except Exception as e:
-            audit_logger.log_event("agentic_knowledge_scanner", "chunking_llm_error", error=str(e))
-            return []

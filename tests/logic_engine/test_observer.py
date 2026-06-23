@@ -9,7 +9,7 @@ from logic_engine.observer import Observer
 class TestObserver(unittest.TestCase):
     def setUp(self):
         self.socket_path = "/tmp/test_anota_syscall.sock"
-        self.observer = Observer(socket_path=self.socket_path)
+        self.observer = Observer(control_socket_path=self.socket_path)
 
     @patch("logic_engine.observer.blackboard")
     @patch("logic_engine.observer.audit_logger")

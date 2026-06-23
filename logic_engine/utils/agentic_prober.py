@@ -31,9 +31,9 @@ class AgenticProber:
         target_areas: List[str], 
         context: Optional[Dict[str, Any]] = None,
         rel_path: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        Probes a file for specific types of vulnerabilities using semantic analysis.
+        Probes a file for specific types of vulnerabilities and leads using semantic analysis.
         
         Args:
             file_path: Absolute path to the file.
@@ -41,7 +41,7 @@ class AgenticProber:
             context: Environmental context (e.g., DB type, auth requirements).
             rel_path: Optional relative path for findings.
         """
-        findings = []
+        results = {"findings": [], "leads": []}
         
         # 1. Get a high-level overview (first 100 lines) to understand context
         try:
@@ -50,21 +50,39 @@ class AgenticProber:
                 context_snippet = "".join(lines[:100])
         except Exception as e:
             logger.error(f"Error reading file for probe: {e}")
-            return []
+            return results
         
         if not context_snippet:
-            return []
+            return results
         
         # Build a system prompt that incorporates the environmental context
         system_prompt_parts = [
-            "You are a specialized security analysis agent. Your task is to identify potential "
-            "vulnerabilities in code snippets. You will be provided with a snippet of code and "
-            "a list of target vulnerability areas to look for.\n\n"
-            "For each identified vulnerability, provide the following in a JSON list:\n"
-            "- 'type': The category of vulnerability (e.g., SQL Injection, XSS, etc.)\n"
-            "- 'description': A brief explanation of why it's a vulnerability\n"
-            "- 'line_range': The estimated line numbers (e.g., [10, 15])\n"
-            "- 'confidence': A score from 0.0 to 1.0"
+            "You are a professional security researcher conducting a deep-dive technical analysis. "
+            "Your task is to identify technical traces and suspicious data flows that constitute potential vulnerabilities or interesting leads. "
+            "STRICT RULE: DO NOT provide 'best practice' advice, 'refactoring suggestions', or 'deprecation warnings'. "
+            "Your output must focus on WHAT IS THERE and HOW IT FLOWS, not how it SHOULD be. "
+            "\n\n"
+            "Output MUST be a single JSON object with two keys: 'findings' and 'leads'.\n"
+            "Each list should contain objects following these schemas:\n\n"
+            "Findings:\n"
+            "- 'type': The technical category (e.g., 'SQL Injection', 'XSS', 'Unsanitized Input').\n"
+            "- 'description': A precise technical observation of the vulnerability (e.g., 'User-controlled $_GET[id] flows directly into mysqli_query').\n"
+            "- 'line_range': The estimated line numbers (e.g., [10, 15]).\n"
+            "- 'confidence': A score from 0.0 to 1.0.\n"
+            "- 'intent': Your objective for this probe.\n"
+            "- 'assumptions': Technical assumptions made (e.g., ['$conn is a mysqli object']).\n"
+            "- 'information_gaps': Missing information needed to confirm this finding (e.g., ['definition of $conn']).\n"
+            "- 'resolution_strategy': How to close the gaps (e.g., ['Trace $conn initialization']).\n\n"
+            "Leads:\n"
+            "- 'type': The lead type (e.g., LEAD_FUNCTION_CALL, LEAD_FILE_INCLUDE).\n"
+            "- 'description': A technical description of why this is a suspicious junction for tracing.\n"
+            "- 'pivot_target': The function name, variable, or file to investigate.\n"
+            "- 'line_range': The estimated line numbers (e.g., [10, 15]).\n"
+            "- 'confidence': A score from 0.0 to 1.0.\n"
+            "- 'intent': Your objective for tracing this lead.\n"
+            "- 'assumptions': Technical assumptions made.\n"
+            "- 'information_gaps': Missing information needed to resolve this lead.\n"
+            "- 'resolution_strategy': How to resolve the gap (e.g., ['Search codebase for definition of pivot_target']).\n"
         ]
         
         if context:
@@ -80,7 +98,8 @@ class AgenticProber:
             f"File: {file_path}\n"
             f"Target Areas: {', '.join(target_areas)}\n\n"
             f"Code Snippet:\n{context_snippet}\n\n"
-            "Identify vulnerabilities matching the target areas. If none are found, return an empty list []."
+            "Identify vulnerabilities matching the target areas and suspicious leads. If none are found, return {'findings': [], 'leads': []}. "
+            "Remember: NO ADVICE. ONLY TECHNICAL TRACES."
         )
         
         try:
@@ -98,31 +117,38 @@ class AgenticProber:
                 response=str(response.content) if hasattr(response, 'content') else str(response)
             )
             
-            findings_data = response.content if isinstance(response.content, list) else []
+            raw_data = response.content if isinstance(response.content, list) else []
             if isinstance(response.content, str):
                 try:
-                    findings_data = json.loads(response.content)
+                    raw_data = json.loads(response.content)
                 except json.JSONDecodeError:
                     # Handle cases where LLM might return markdown-wrapped JSON
                     if "```json" in response.content:
                         json_str = re.search(r"```json\n(.*?)\n```", response.content, re.DOTALL)
                         if json_str:
-                            findings_data = json.loads(json_str.group(1))
+                            raw_data = json.loads(json_str.group(1))
                     else:
-                        findings_data = []
-
-            if isinstance(findings_data, list):
-                enriched_findings = []
-                for f in findings_data:
+                        raw_data = {"findings": [], "leads": []}
+            
+            if isinstance(raw_data, dict):
+                # Validate findings
+                for f in raw_data.get("findings", []):
                     if all(k in f for k in ("type", "description", "line_range", "confidence")):
                         f["file"] = rel_path if rel_path else file_path
-                        enriched_findings.append(f)
-                return enriched_findings
-
-        except Exception as e:
-            logger.error(f"Error probing file {file_path}: {e}")
+                        results["findings"].append(f)
+                
+                # Validate leads
+                for l in raw_data.get("leads", []):
+                    if all(k in l for k in ("type", "description", "pivot_target", "line_range", "confidence")):
+                        l["file"] = rel_path if rel_path else file_path
+                        results["leads"].append(l)
             
-        return []
+            return results
+        except Exception as e:
+            logger.error(f"Error in probe_file_for_vulnerabilities: {e}")
+            return {"findings": [], "leads": []}
+
+
 
 
     async def probe_for_context(self, file_path: str, query: str) -> str:

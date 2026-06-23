@@ -16,7 +16,7 @@ class AgenticCodebaseScanner(CodebaseScanner):
     def __init__(self, target_path: str, knowledge_base_path: str, blackboard: Optional[Any] = None, prefix: Optional[str] = None):
         super().__init__(target_path, knowledge_base_path, blackboard, prefix)
 
-    async def scan_and_synthesize(self, knowledge_index: Optional[Dict[str, Any]] = None, scan_results: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    async def scan_and_synthesize(self, knowledge_index: Optional[Dict[str, Any]] = None, scan_results: Optional[Dict[str, Any]] = None) -> Dict[str, List[Dict[str, Any]]]:
         """
         Performs the full probe-and-synthesize workflow.
         """
@@ -24,62 +24,53 @@ class AgenticCodebaseScanner(CodebaseScanner):
         
         if scan_results:
             attack_surface = scan_results.get("attack_surface", [])
-            logger.info(f"[*] Using provided scan results with {len(attack_surface)} findings. Skipping baseline scan.")
+            leads = scan_results.get("leads", [])
+            logger.info(f"[*] Using provided scan results with {len(attack_surface)} findings and {len(leads)} leads. Skipping baseline scan.")
         else:
             logger.info("[*] No scan results provided. Running baseline scan first...")
             baseline_results = await self.scan(knowledge_index=knowledge_index)
             attack_surface = baseline_results.get("attack_surface", [])
+            leads = baseline_results.get("leads", [])
         
         code_facts = []
         
         # 2. Deep-dive into identified attack surface areas
-        
         logger.info(f"[*] Found {len(attack_surface)} potential findings in baseline scan. Starting deep-dive synthesis...")
-
-        # We'll group findings by file to avoid redundant probes
-        findings_by_file: Dict[str, List[Dict[str, Any]]] = {}
+        
+        results = []
         for finding in attack_surface:
-            f_path = finding["file"]
-            if f_path not in findings_by_file:
-                findings_by_file[f_path] = []
-            findings_by_file[f_path].append(finding)
-
-        # Use a semaphore to limit concurrent LLM calls to avoid overwhelming the provider/orchestrator
-        semaphore = asyncio.Semaphore(3)
-
-        async def sem_synthesize(rel_path: str, file_findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-            async with semaphore:
+            # For each finding, try to synthesize more detailed code facts
+            # In a real implementation, this would involve probing the target
+            # For now, we use the finding itself as a basis for synthesis
+            
+            # We need to get the file content to synthesize
+            try:
+                rel_path = finding.get("file")
+                if not rel_path:
+                    continue
+                
                 full_path = os.path.join(self.target_path, rel_path)
                 if not os.path.exists(full_path):
-                    return []
+                    continue
+
+                with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
                 
-                # Report progress via blackboard
-                if self.blackboard:
-                    self.blackboard.add_fact("synthesis_progress", {"file": rel_path})
+                new_facts = await self._synthesize_code_facts(rel_path, content, [finding], knowledge_index)
+                if new_facts:
+                    results.append(new_facts)
+            except Exception as e:
+                logger.error(f"    [!] Error during deep-dive synthesis for {finding.get('file')}: {e}")
 
-                logger.info(f"    [>] Synthesizing facts for {rel_path}...")
-                
-                try:
-                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        code_content = f.read()
-                    
-                    return await self._synthesize_code_facts(rel_path, code_content, file_findings, knowledge_index)
-                except Exception as e:
-                    audit_logger.log_event("agentic_codebase_scanner", "synthesis_error", input_data={"file": rel_path}, error=str(e))
-                    return []
-
-        # Run all synthesis tasks in parallel with controlled concurrency
-        tasks = [sem_synthesize(rel_path, file_findings) for rel_path, file_findings in findings_by_file.items()]
-        results = await asyncio.gather(*tasks)
-
-        # Flatten results
+        # 3. Flatten results
         code_facts = []
         for new_facts in results:
             if new_facts:
                 code_facts.extend(new_facts)
 
-        audit_logger.log_event("agentic_codebase_scanner", "scan_synthesize_complete", output_data={"facts_found": len(code_facts)})
-        return code_facts
+        audit_logger.log_event("agentic_codebase_scanner", "scan_synthesize_complete", output_data={"facts_found": len(code_facts), "leads_found": len(leads)})
+        return {"code_facts": code_facts, "leads": leads}
+
 
     def _get_relevant_code_snippets(self, code_content: str, findings: List[Dict[str, Any]], window_size: int = 10) -> str:
         """

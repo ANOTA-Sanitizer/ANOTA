@@ -44,14 +44,11 @@ class Blackboard:
         audit_logger.log_event("blackboard", "save_state", input_data=self.state)
 
     def add_fact(self, *args, metadata: Optional[Dict[str, Any]] = None):
-        """Adds a new fact to the blackboard. Supports (content) or (key, value) or (structured_dict)."""
+        """Adds a new fact to the blackboard. Supports (content) or (key, value)."""
         fact_entry = {"timestamp": datetime.now().isoformat()}
         
         if len(args) == 1:
-            if isinstance(args[0], dict):
-                fact_entry.update(args[0])
-            else:
-                fact_entry["content"] = args[0]
+            fact_entry["content"] = args[0]
         elif len(args) == 2:
             fact_entry["key"] = args[0]
             fact_entry["value"] = args[1]
@@ -81,13 +78,9 @@ class Blackboard:
     def add_verified_finding(self, finding: Any, metadata: Optional[Dict[str, Any]] = None):
         """Adds a verified finding to the blackboard."""
         finding_entry = {
+            "content": finding,
             "timestamp": datetime.now().isoformat()
         }
-        
-        if isinstance(finding, dict):
-            finding_entry.update(finding)
-        else:
-            finding_entry["content"] = finding
         
         if metadata:
             finding_entry["metadata"] = metadata

@@ -67,7 +67,8 @@ class CodebaseScanner:
         results = {
             "entrypoints": [],
             "technical_context": {},
-            "attack_surface": []
+            "attack_surface": [],
+            "leads": []
         }
         
         if not os.path.exists(self.target_path):
@@ -163,27 +164,31 @@ class CodebaseScanner:
                         file_findings.append(finding)
                         break # One match per area per file is enough for a baseline
 
-            # 3. Agentic Verification
-            if file_findings:
-                # Extract unique areas found in this file
-                found_areas = list(set(f["type"] for f in file_findings))
-                
-                # Get agentic findings
-                agentic_findings = await self.prober.probe_file_for_vulnerabilities(
-                    full_path,
-                    found_areas,
-                    context=results["technical_context"],
-                    rel_path=rel_path
-                )
+                # 3. Agentic Verification
+                if file_findings:
+                    # Extract unique areas found in this file
+                    found_areas = list(set(f["type"] for f in file_findings))
+                    
+                    # Get agentic findings
+                    agentic_results = await self.prober.probe_file_for_vulnerabilities(
+                        full_path,
+                        found_areas,
+                        context=results["technical_context"],
+                        rel_path=rel_path
+                    )
 
+                    # Add agentic findings
+                    for af in agentic_results.get("findings", []):
+                        # We use a simple heuristic for deduplication: type + line_range
+                        if not any(f["type"] == af["type"] and f["line_range"] == af["line_range"] for f in file_findings):
+                            af["file"] = rel_path
+                            af["method"] = "agentic"
+                            file_findings.append(af)
 
-                for af in agentic_findings:
-                    # Add agentic findings to file_findings
-                    # We use a simple heuristic for deduplication: type + line_range
-                    if not any(f["type"] == af["type"] and f["line_range"] == af["line_range"] for f in file_findings):
-                        af["file"] = rel_path
-                        af["method"] = "agentic"
-                        file_findings.append(af)
+                    # Add agentic leads
+                    for lead in agentic_results.get("leads", []):
+                        results["leads"].append(lead)
+
 
             # 4. Knowledge Correlation
             if knowledge_index:

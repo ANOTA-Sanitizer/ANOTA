@@ -1,6 +1,7 @@
 import os
 import asyncio
 import json
+from datetime import datetime
 from typing import TypedDict, Annotated, List, Dict, Any, Optional
 from langgraph.graph import StateGraph, END
 from logic_engine.blackboard import blackboard
@@ -10,9 +11,12 @@ from logic_engine.reasoning_engine import ReasoningEngine
 from logic_engine.agentic_codebase_scanner import AgenticCodebaseScanner
 from logic_engine.executor import Executor
 from logic_engine.utils.logger import logger
+from logic_engine.utils.semantic_reader import SemanticReader
 from logic_engine.knowledge_scanner import StructuralIndex
 from logic_engine.scanners.config_scanner import AgenticConfigScanner
 from logic_engine.scanners.setup_orchestrator import TargetSetupOrchestrator
+from logic_engine.agents.trace_agent import TraceAgent
+from logic_engine.utils.agentic_prober import AgenticProber
 
 class AgentState(TypedDict):
     task: str
@@ -28,12 +32,14 @@ class AgentState(TypedDict):
     verdict: Dict[str, Any]
     repro_script: str
     findings: List[Dict[str, Any]]
+    leads: List[Dict[str, Any]]
     challenges: List[Dict[str, Any]]
     current_challenge_index: int
     observation: Dict[str, Any]
     next_action: str
     checkpoint: Optional[Dict[str, Any]]
     setup_completed: bool
+    trace_success: bool
 
 class MockMemory:
     def __init__(self, repo_path):
@@ -63,6 +69,9 @@ class AgentOrchestrator:
         self.reasoner = ReasoningEngine(self.knowledge_base_path)
         self.executor = Executor()
         self.memory = MockMemory(self.repo_path)
+        self.reader = SemanticReader()
+        self.prober = AgenticProber()
+        self.trace_agent = TraceAgent(self.repo_path, self.reader, self.prober, self.blackboard)
         
         self.observer.start_listening()
         
@@ -73,9 +82,18 @@ class AgentOrchestrator:
         """Real-time terminal telemetry for blackboard changes."""
         if event_type == "fact_added":
             key = data.get('key')
-            content = data.get('content')
+            content = data.get('content') or data.get('value')
+            
             if key == "synthesis_progress":
                 logger.info(f"    [>] Synthesis Progress: {data.get('value', {}).get('file')}")
+            elif key in ["code_facts", "leads"]:
+                if isinstance(content, list):
+                    for item in content:
+                        self._log_granular_fact(key, item)
+                elif isinstance(content, dict):
+                    self._log_granular_fact(key, content)
+                else:
+                    logger.info(f"    [+] {key.capitalize()} Fact: {content}")
             else:
                 logger.info(f"    [+] Blackboard Fact: {key or content}")
         elif event_type == "hypothesis_added":
@@ -86,6 +104,20 @@ class AgentOrchestrator:
             logger.info(f"    [*] Blackboard Context: {data.get('key')} = {data.get('value')}")
         elif event_type == "blackboard_cleared":
             logger.info("    [!] Blackboard Cleared")
+
+    def _log_granular_fact(self, key: str, item: Dict[str, Any]):
+        """Helper to log detailed granular facts."""
+        intent = item.get('intent', 'N/A')
+        assumptions = item.get('assumptions', 'N/A')
+        gaps = item.get('information_gaps', 'N/A')
+        logger.info(f"    [+] {key.capitalize()} Fact:")
+        logger.info(f"        | Intent: {intent}")
+        logger.info(f"        | Assumptions: {assumptions}")
+        logger.info(f"        | Gaps: {gaps}")
+        if 'file' in item:
+            line_range = item.get('line_range', [None])
+            line = line_range[0] if line_range and line_range[0] is not None else ""
+            logger.info(f"        | Target: {item['file']}:{line}")
 
     def _routing_node(self, state: AgentState) -> AgentState:
         """Decide the initial entry point of the graph."""
@@ -137,6 +169,12 @@ class AgentOrchestrator:
             return "challenge_generation"
         return "static_discovery"
 
+    def _route_from_static_discovery(self, state: AgentState) -> str:
+        """Routing decision after static discovery."""
+        if state.get("leads"):
+            return "trace_exploration"
+        return "challenge_generation"
+
     async def _static_discovery_node(self, state: AgentState) -> AgentState:
         logger.info("Running Static Discovery...")
         target_path = self.memory.codebase.root_path
@@ -155,14 +193,21 @@ class AgentOrchestrator:
         
         # 4. Perform Agentic Codebase Scanning (Probe-and-Synthesize)
         logger.info("Performing Agentic Codebase Scanning (Probe-and-Synthesize)...")
-        code_facts = await self.codebase_scanner.scan_and_synthesize(knowledge_index=knowledge_map, scan_results=scan_results)
+        scan_synthesized = await self.codebase_scanner.scan_and_synthesize(knowledge_index=knowledge_map, scan_results=scan_results)
+        code_facts = scan_synthesized["code_facts"]
+        leads = scan_synthesized["leads"]
         
         # Populate Blackboard
         self.blackboard.add_fact("discovered_entrypoints", scan_results["entrypoints"])
         self.blackboard.add_fact("technical_context", scan_results["technical_context"])
         self.blackboard.add_fact("attack_surface", scan_results["attack_surface"])
         self.blackboard.add_fact("knowledge_map", knowledge_map)
-        self.blackboard.add_fact("code_facts", code_facts)
+        
+        for fact in code_facts:
+            self.blackboard.add_fact("code_facts", fact)
+        
+        for lead in leads:
+            self.blackboard.add_fact("leads", lead)
         
         # Update State
         state["context"]["discovered_entrypoints"] = scan_results["entrypoints"]
@@ -170,6 +215,7 @@ class AgentOrchestrator:
         state["context"]["attack_surface"] = scan_results["attack_surface"] + code_facts
         state["context"]["knowledge_map"] = knowledge_map
         state["findings"] = code_facts
+        state["leads"] = leads
         
         # Save checkpoint immediately after discovery to allow resumption
         self._save_checkpoint(state)
@@ -294,6 +340,42 @@ class AgentOrchestrator:
         
         return state
 
+    async def _trace_exploration_node(self, state: AgentState) -> AgentState:
+        """Resolves discovered leads to uncover more findings."""
+        leads = state.get("leads", [])
+        if not leads:
+            state["trace_success"] = False
+            return state
+
+        logger.info(f"Starting trace exploration for {len(leads)} leads...")
+        
+        # Resolve leads and get new findings
+        new_findings = await self.trace_agent.resolve_leads(leads, self.repo_path)
+        
+        if new_findings:
+            logger.info(f"    [+] Found {len(new_findings)} new findings through trace exploration.")
+            # Add new findings to attack surface and findings
+            state["context"]["attack_surface"].extend(new_findings)
+            state["findings"].extend(new_findings)
+            state["trace_success"] = True
+        else:
+            logger.info("    [-] No new findings discovered through trace exploration.")
+            state["trace_success"] = False
+
+        # Clear leads so we don't loop forever
+        state["leads"] = []
+        
+        # Save checkpoint
+        self._save_checkpoint(state)
+        
+        return state
+
+    def _route_from_trace_exploration(self, state: AgentState) -> str:
+        """Routing decision after trace exploration."""
+        if state.get("trace_success"):
+            return "static_discovery"
+        return "challenge_generation"
+
     def _should_continue(self, state: AgentState) -> str:
         idx = state.get("current_challenge_index", 0)
         challenges = state.get("challenges", [])
@@ -348,12 +430,14 @@ class AgentOrchestrator:
             "verdict": {},
             "repro_script": "",
             "findings": [],
+            "leads": [],
             "challenges": [],
             "current_challenge_index": 0,
             "observation": {},
             "next_action": "",
             "checkpoint": None,
-            "setup_completed": False
+            "setup_completed": False,
+            "trace_success": False
         }
 
     def _build_graph(self):
@@ -363,6 +447,7 @@ class AgentOrchestrator:
         workflow.add_node("setup", self._setup_node)
         workflow.add_node("check_discovery", self._check_discovery_node)
         workflow.add_node("static_discovery", self._static_discovery_node)
+        workflow.add_node("trace_exploration", self._trace_exploration_node)
         workflow.add_node("challenge_generation", self._challenge_generation_node)
         workflow.add_node("requester", self._requester_node)
         workflow.add_node("executor", self._executor_node)
@@ -387,7 +472,15 @@ class AgentOrchestrator:
                 "challenge_generation": "challenge_generation"
             }
         )
-        workflow.add_edge("static_discovery", "challenge_generation")
+        workflow.add_conditional_edges(
+            "static_discovery",
+            self._route_from_static_discovery,
+            {
+                "trace_exploration": "trace_exploration",
+                "challenge_generation": "challenge_generation"
+            }
+        )
+        workflow.add_edge("trace_exploration", "static_discovery")
         workflow.add_edge("challenge_generation", "requester")
         workflow.add_edge("requester", "executor")
         workflow.add_edge("executor", "observer")
@@ -402,5 +495,3 @@ class AgentOrchestrator:
         )
 
         return workflow.compile()
-
-

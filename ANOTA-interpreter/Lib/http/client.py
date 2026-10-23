@@ -1127,6 +1127,10 @@ class HTTPConnection:
         url = url or '/'
         self._validate_path(url)
 
+        if _ANOTA_URL_ACTIVE():
+            from anota_url import check_http
+            check_http(self, url)
+
         request = '%s %s %s' % (method, url, self._http_vsn_str)
 
         self._output(self._encode_request(request))

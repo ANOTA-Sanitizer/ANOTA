@@ -10592,6 +10592,8 @@ _PyUnicode_JoinArray(PyObject *separator, PyObject *const *items, Py_ssize_t seq
         assert(res_offset == PyUnicode_GET_LENGTH(res));
     }
 
+    if (seqlen > 1) _PyAnotaTaint_Propagate(separator, res);
+    for (i = 0; i < seqlen; i++) _PyAnotaTaint_Propagate(items[i], res);
     Py_XDECREF(sep);
     assert(_PyUnicode_CheckConsistency(res, 1));
     return res;

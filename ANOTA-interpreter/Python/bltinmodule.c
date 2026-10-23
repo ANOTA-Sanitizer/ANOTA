@@ -5,6 +5,7 @@
 #include "anota_execution.h"
 #include "anota_taint.h"
 #include "anota_syscall.h"
+#include "anota_policy.h"
 #include <ctype.h>
 #include "pycore_ast.h"           // _PyAST_Validate()
 #include "pycore_compile.h"       // _PyAST_Compile()
@@ -32,13 +33,13 @@ _Py_IDENTIFIER(stderr);
 PyDoc_STRVAR(anota_syscall_signal_start_doc,
 "ANOTA_SYSCALL_SIGNAL_START(pid=None)\n\
 \n\
-Request the external syscall monitor to begin tracing. If *pid* is provided,\n\
-only syscalls from that process will be observed; otherwise, all processes are traced.");
+Upload current policies and trace *pid* (default: this process) and its\n\
+future descendants. Wait for the Aya monitor to acknowledge installation.");
 
 PyDoc_STRVAR(anota_syscall_signal_stop_doc,
 "ANOTA_SYSCALL_SIGNAL_STOP()\n\
 \n\
-Request the external syscall monitor to stop tracing.");
+Stop this monitoring session and its descendants; wait for acknowledgement.");
 
 #include "clinic/bltinmodule.c.h"
 
@@ -2960,8 +2961,11 @@ static PyMethodDef builtin_methods[] = {
     BUILTIN_OCT_METHODDEF
     BUILTIN_ORD_METHODDEF
     BUILTIN_POW_METHODDEF
-    {"ANOTA_TAINT",     (PyCFunction)_PyAnota_Taint,                     METH_VARARGS | METH_KEYWORDS, NULL},
-    {"ANOTA_SYSCALL_SIGNAL_START", (PyCFunction)_PyAnotaSyscall_SignalStart,
+    {"CLEAR", (PyCFunction)_PyAnota_Clear, METH_VARARGS, "CLEAR(handle) removes one annotation; CLEAR() resets all policy families."},
+    {"ANOTA_CLEAR", (PyCFunction)_PyAnota_Clear, METH_VARARGS, "Alias for CLEAR."},
+    {"_ANOTA_CHECK_URL", (PyCFunction)_PyAnotaSyscall_CheckURL, METH_VARARGS, NULL},
+    {"_ANOTA_URL_ACTIVE", (PyCFunction)_PyAnotaSyscall_URLActive, METH_NOARGS, NULL},
+    {"ANOTA_SYSCALL_SIGNAL_START", (PyCFunction)(void(*)(void))_PyAnotaSyscall_SignalStart,
      METH_VARARGS | METH_KEYWORDS, anota_syscall_signal_start_doc},
     {"ANOTA_SYSCALL_SIGNAL_STOP", (PyCFunction)_PyAnotaSyscall_SignalStop,
      METH_NOARGS, anota_syscall_signal_stop_doc},
@@ -3009,6 +3013,14 @@ _PyBuiltin_Init(PyInterpreterState *interp)
     if (mod == NULL)
         return NULL;
     dict = PyModule_GetDict(mod);
+
+    PyObject *taint = _PyAnotaTaint_GetSingleton();
+    if (taint == NULL || PyDict_SetItemString(dict, "ANOTA_TAINT", taint) < 0) {
+        Py_XDECREF(taint);
+        Py_DECREF(mod);
+        return NULL;
+    }
+    Py_DECREF(taint);
 
     /* Expose ANOTA_WATCH singleton in builtins so that user code can write
        ANOTA_WATCH.ALLOW(obj, "R"), etc. */

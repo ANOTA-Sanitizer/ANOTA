@@ -5,10 +5,14 @@ extern "C" {
 #endif
 
 #include "Python.h"
+PyAPI_FUNC(int) _PyAnotaSyscall_IsController(PyObject *obj);
 
 /* Public-ish helper used by bltinmodule.c to expose the singleton
    ANOTA_SYSCALL policy controller. */
 PyAPI_FUNC(PyObject *) _PyAnotaSyscall_GetSingleton(void);
+PyAPI_FUNC(int) _PyAnotaSyscall_ClearAll(void);
+PyAPI_FUNC(PyObject *) _PyAnotaSyscall_CheckURL(PyObject *self, PyObject *args);
+PyAPI_FUNC(PyObject *) _PyAnotaSyscall_URLActive(PyObject *self, PyObject *unused);
 
 /* Internal helper used by various I/O and os.* wrappers to enforce the
    syscall policy engine. Returns 0 on success, -1 on policy violation

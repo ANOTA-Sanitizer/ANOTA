@@ -527,6 +527,9 @@ class OpenerDirector:
         return response
 
     def _open(self, req, data=None):
+        if _ANOTA_URL_ACTIVE():
+            from anota_url import check_request
+            check_request(req)
         result = self._call_chain(self.handle_open, 'default',
                                   'default_open', req)
         if result:

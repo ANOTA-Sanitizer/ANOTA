@@ -2,6 +2,7 @@
 /* Generic object operations; and implementation of None */
 
 #include "Python.h"
+#include "anota_watch.h"
 #include "pycore_ceval.h"         // _Py_EnterRecursiveCall()
 #include "pycore_context.h"
 #include "pycore_initconfig.h"
@@ -919,6 +920,7 @@ restore:
 PyObject *
 PyObject_GetAttr(PyObject *v, PyObject *name)
 {
+    if (_PyAnota_CheckReadMember(PyThreadState_Get(), v, name) < 0) return NULL;
     PyTypeObject *tp = Py_TYPE(v);
     if (!PyUnicode_Check(name)) {
         PyErr_Format(PyExc_TypeError,
@@ -953,6 +955,7 @@ PyObject_GetAttr(PyObject *v, PyObject *name)
 int
 _PyObject_LookupAttr(PyObject *v, PyObject *name, PyObject **result)
 {
+    if (_PyAnota_CheckReadMember(PyThreadState_Get(), v, name) < 0) { *result = NULL; return -1; }
     PyTypeObject *tp = Py_TYPE(v);
 
     if (!PyUnicode_Check(name)) {
@@ -1028,6 +1031,7 @@ PyObject_HasAttr(PyObject *v, PyObject *name)
 int
 PyObject_SetAttr(PyObject *v, PyObject *name, PyObject *value)
 {
+    if (_PyAnota_CheckWriteMember(PyThreadState_Get(), v, name) < 0) return -1;
     PyTypeObject *tp = Py_TYPE(v);
     int err;
 
@@ -1332,6 +1336,7 @@ _PyObject_GenericGetAttrWithDict(PyObject *obj, PyObject *name,
 PyObject *
 PyObject_GenericGetAttr(PyObject *obj, PyObject *name)
 {
+    if (_PyAnota_CheckReadMember(PyThreadState_Get(), obj, name) < 0) return NULL;
     return _PyObject_GenericGetAttrWithDict(obj, name, NULL, 0);
 }
 
@@ -1413,6 +1418,7 @@ _PyObject_GenericSetAttrWithDict(PyObject *obj, PyObject *name,
 int
 PyObject_GenericSetAttr(PyObject *obj, PyObject *name, PyObject *value)
 {
+    if (_PyAnota_CheckWriteMember(PyThreadState_Get(), obj, name) < 0) return -1;
     return _PyObject_GenericSetAttrWithDict(obj, name, value, NULL);
 }
 

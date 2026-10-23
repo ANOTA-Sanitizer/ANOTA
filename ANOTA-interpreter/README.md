@@ -90,35 +90,11 @@ sudo make altinstall
 
 `altinstall` avoids overwriting the system’s default `python3`.
 
-### 6. Optional Syscall Monitor Integration
+### 6. Optional Aya Syscall Monitor
 
-The Rust daemon under `syscall-module/` requires the nightly toolchain because
-its dependencies currently target `edition2024`. Install it once via
-
-```bash
-rustup toolchain install nightly
-```
-
-Then run the end-to-end integration test:
-
-```bash
-./python ANOTA-tests/anota_syscall_integration_test.py
-```
-
-The script automatically builds the daemon using `cargo +nightly` and exercises
-the `ANOTA_SYSCALL_SIGNAL_START/STOP` helpers.
-
-Note: the Aya crates required by the daemon are vendored under
-`syscall-module/aya-src`, so no network access or git submodules are necessary.
-
-### Syscall Tracepoint Overview
-
-The Rust crate at `syscall-module/syscall-tracepoint/` provides the low-level
-syscall monitors used by the daemon. It attaches to Linux syscall tracepoints,
-collects per-call metadata, and forwards events through the shared types in
-`syscall-tracepoint-common` to the rest of the workspace. You typically do not
-need to touch it directly—building the daemon or running the integration tests
-automatically compiles the tracepoint code alongside its eBPF helpers.
+See [`syscall-module/README.md`](syscall-module/README.md) for build and run instructions.
+Use `ANOTA_SYSCALL_BACKEND=ebpf` or `ANOTA_SYSCALL_SIGNAL_START()` to monitor
+native syscalls and future child processes/threads. Violations print to stderr.
 
 All ANOTA-specific tests and fixtures live under `ANOTA-tests/`.
 
@@ -171,6 +147,9 @@ ANOTA_WATCH.CON(callable, fixed_args, random_args,
 - Use `ALLOW` when you want to specify the exact set of modes that remain permitted; everything else is implicitly denied.
 - Use `BLOCK` for one-off denials.
 - Provide `key` (attribute name, dict key, index, etc.) to scope policies to individual fields.
+- `ALLOW` and `BLOCK` return removable policy handles.
+- Builtin list/dict operations and attribute APIs such as `getattr` follow the same policies.
+  Structural list changes check all indexed member policies.
 - `CLEAR`/`CLEAR_ALL` remove policies so code can proceed normally again.
 - `CON(...)` runs a [Dudect-style](https://github.com/oreparaz/dudect) timing test inside the interpreter and raises if
   the measured timing difference exceeds the threshold.
@@ -198,19 +177,22 @@ Current limitations:
 ### Usage Summary
 
 ```python
-ANOTA_TAINT(obj, sanitization=[hash], Sink=[print])
+rule = ANOTA_TAINT(obj, sanitization=[hash], Sink=[print])
+ANOTA_TAINT.IS_TAINTED(obj)
+ANOTA_TAINT.CLEAR(obj)
+ANOTA_TAINT.CLEAR_ALL()
 ```
 
-- `obj` becomes tainted by object identity and will propagate warnings if it
-  reaches listed sinks.
-- Any function listed under `sanitization` clears taint on its return value.
-- Any function listed under `Sink` raises `RuntimeError` when called with tainted arguments.
+- Taint follows object identity through formatting, joins, nested builtin containers, and function returns.
+- Sanitizers clear only their registered sources from a result.
+- Listed sinks raise `RuntimeError` on tainted arguments. Without `Sink`, the defaults are `print`, `write`, and `writelines`; `Sink=[]` disables sink checks.
 - Tainted callables propagate taint to their return values.
-- `write` as a default sink intent.
-- Current supported str-like objects for cross-interface taint track are [bytesobject]([ANOTA-interpreter/Objects/bytesobject.c:140), [bytearrayobject](ANOTA-interpreter/Objects/bytearrayobject.c:107) and [unicodeobject.c](ANOTA-interpreter/Objects/unicodeobject.c:2302).
-- In example, DFSan-instrumented native code can report tainted `write()` and `printf()`
-  sink hits back into the interpreter, where they surface as
-  `RuntimeError("ANOTA_TAINT native sink violation")`.
+- `CLEAR(obj)` revokes the sources reaching that object, including aliases and derived values. `CLEAR_ALL()` resets all taint policies.
+- Native bytes/bytearray/unicode tracking requires DFSan. The example extension checks native `write()` and `printf()` sinks.
+
+Tracking is object-level: implicit flows and arbitrary custom container internals
+are not covered. Native label slots are not recycled on reset.
+
 ---
 
 ## 4. Experimental Native Instrumentation Helpers (`Lib/anota_native.py`)
@@ -236,21 +218,51 @@ To use the current version with LLVM data-flow sanitizer. you need to
 
 ### Usage Summary
 
-`ANOTA_SYSCALL` lets you monitor file, process, and network operations issued through CPython’s standard wrappers. Policies can be written globally or scoped to a particular operation:
-
 ```python
-ANOTA_SYSCALL.READ.BLOCK(PATH="/etc/passwd")
-ANOTA_SYSCALL.READ.ALLOW(PATH="/var/log/")
-ANOTA_SYSCALL.CONNECT.BLOCK(DOMAIN="*.example.com")
-ANOTA_SYSCALL.CONNECT.BLOCK(IP="10.*")
-ANOTA_SYSCALL.SOCKET.BLOCK(PROTOCOL="TCP")
+ANOTA_SYSCALL.READ.BLOCK(PATH="/etc/shadow")
+ANOTA_SYSCALL.FILE.ALLOW(PATH="/srv/app/public/")
+ANOTA_SYSCALL.CONNECT.BLOCK(IP="127.*")
+ANOTA_SYSCALL.SOCKET.BLOCK(PROTOCOL="UDP")
+ANOTA_SYSCALL.BLOCK("execve", "execveat")
+ANOTA_SYSCALL_SIGNAL_START()
+ANOTA_SYSCALL.READ.CLEAR()
+ANOTA_SYSCALL_SIGNAL_STOP()
 ```
 
-- Accepted keywords: `PATH`, `DOMAIN`, `IP`, `PROTOCOL`. Supply only one per call.
-- Wildcards (`*`) are supported in all fields. Append `/` to a path to match an entire directory tree.
-- Global controls: `ANOTA_SYSCALL.ALLOW("execve")`, `ANOTA_SYSCALL.BLOCK("open", "execv")`.
-- Violations are logged to stderr so you can review which syscall and target triggered the policy.
-- System-wide collection is driven by the Rust daemon in `syscall-module`. Use helper functions such as `ANOTA_SYSCALL_SIGNAL_START(pid=None)` / `ANOTA_SYSCALL_SIGNAL_STOP()` to send `START`/`STOP` commands to `/tmp/anota_syscall.sock` and bracket the region you want to trace.
+- Accepted fields: `PATH`, `DOMAIN`, `IP`, `PROTOCOL`; supply one per call.
+- Paths support `*` and trailing `/` for directories. In eBPF mode, `DOMAIN` resolves exact names; wildcard domains are unsupported.
+- `ANOTA_SYSCALL_BACKEND=ebpf` activates the monitor automatically. Otherwise, call `ANOTA_SYSCALL_SIGNAL_START()` for kernel monitoring.
+- `ANOTA_SYSCALL_SOCKET` overrides `/tmp/anota_syscall.sock`.
+- Violations log to stderr; monitor setup/update failures raise. See the [monitor guide](syscall-module/README.md).
+
+### URL policies
+
+```python
+ANOTA_SYSCALL.NETWORK.BLOCK(SCHEME=["file", "data", "ftp"])
+ANOTA_SYSCALL.NETWORK.BLOCK(HOST="*.internal.example")
+ANOTA_SYSCALL.URL.ALLOW(SCHEME="https")
+```
+
+- `NETWORK` and `URL` accept `SCHEME`/`HOST`, one field per call, as strings or lists with `*` wildcards.
+- Hosts are case-insensitive and normalized for IDNA/IPv6. Supply a hostname/IP without port or user information.
+- Checks cover `urllib.request` and `http.client`, including redirects and proxies. Other clients need their own hooks.
+- URL violations print to the interpreter's stderr, including in eBPF mode. URL rules are checked locally.
+
+### Policy lifecycle
+
+```python
+rule = ANOTA_WATCH.BLOCK(buffer, "W")
+CLEAR(rule)                 # or rule.clear()
+CLEAR()                     # reset WATCH, TAINT, syscall and URL policies
+
+with ANOTA_SYSCALL.NETWORK.BLOCK(HOST="private.example"):
+    run_request()
+```
+
+- WATCH, TAINT, and syscall rules return handles with an `active` property. Clearing a handle is idempotent and preserves other annotations.
+- Discarding a handle keeps its policy; `with` clears it on exit. `ANOTA_CLEAR` is an alias for `CLEAR`.
+- Rejected monitor updates preserve local rules. After a connection failure, reinstall policies because the remote outcome may be unknown.
+- Clearing rules keeps monitoring active; use `ANOTA_SYSCALL_SIGNAL_STOP()` to stop it.
 
 ---
 
@@ -349,29 +361,38 @@ ANOTA_SYSCALL.SOCKET.BLOCK(PROTOCOL="TCP")
   - Network policies (domain/IP allow/deny with wildcards).
 - Protocol-level blocking (`SOCKET` policy).
 
-### 6.6 `anota_syscall_signal_test.py`
+### 6.7 `anota_syscall_signal_test.py`
 
-- Validates the `ANOTA_SYSCALL_SIGNAL_START/STOP` helpers that talk to the Rust monitoring daemon.
+- Tests policy snapshots, acknowledgements, clearing, and rollback with a mock server.
 - Run with:
 
-  ```
+  ```bash
   ./python ANOTA-tests/anota_syscall_signal_test.py
   ```
 
-- The script spins up a dummy UNIX socket server in `/tmp/anota_syscall.sock` and ensures the helpers emit `START [pid]` and `STOP` commands without errors.
+### 6.8 `anota_syscall_integration_test.py`
 
-### 6.7 `anota_syscall_integration_test.py`
+- Tests the built daemon; `--kernel` also checks real syscall capture.
+- Run with system Python:
 
-- Builds (if necessary) and launches the Rust daemon in `syscall-module`, then exercises the Python `ANOTA_SYSCALL_SIGNAL_START/STOP` helpers against the real control socket.
-- Run with:
-
+  ```bash
+  python3 ANOTA-tests/anota_syscall_integration_test.py
+  sudo python3 ANOTA-tests/anota_syscall_integration_test.py --kernel
   ```
-  ./python ANOTA-tests/anota_syscall_integration_test.py
+
+- Use `--python /path/to/instrumented/python` for a separate interpreter build.
+
+### 6.9 Policy and URL regressions
+
+- Tests taint/WATCH coverage, policy handles/reset, URL rules, and monitor-update rollback.
+- Run with system Python; no root required:
+
+  ```bash
+  python3 ANOTA-tests/anota_policy_regression_test.py --python "$PWD/python"
+  python3 ANOTA-tests/anota_policy_sync_test.py --python "$PWD/python"
   ```
 
-- The script sets `ANOTA_SYSCALL_SKIP_EBPF=1` so no root privileges are required; it focuses on the control-plane integration.
-
-### 6.8 Additional Coverage
+### 6.10 Additional Coverage
 
 - Interpreter bytecode tests (e.g., `ANOTA-tests/test_nested_sink.py`,
   `ANOTA-tests/test_taint_propagation.py`) integrate the taint hooks into real
@@ -383,10 +404,10 @@ ANOTA_SYSCALL.SOCKET.BLOCK(PROTOCOL="TCP")
 ## Usage Notes
 
 1. Always launch the custom interpreter (`./python`) so that the ANOTA singletons are available in `builtins`.
-2. Policies persist within a process; call `ANOTA_* .clear()` or `CLEAR_ALL()`
-   between tests or when updating configuration at runtime.
+2. Policies persist within a process; use `CLEAR()` between independent
+   requests/tests, or clear individual handles for scoped annotations.
 3. `ANOTA_WATCH`, `ANOTA_TAINT`, and `ANOTA_EXECUTION` raise `RuntimeError`
-   when a policy violation is detected. `ANOTA_SYSCALL` currently logs without
-   raising.
-4. Wildcards can be used in PATH, DOMAIN, IP, and PROTOCOL values. For
+   when a policy violation is detected. `ANOTA_SYSCALL` logs violations without
+   raising; monitor setup/synchronization failures do raise.
+4. Wildcards can be used in PATH, DOMAIN, IP, PROTOCOL, SCHEME, and HOST values. For
    directory scopes, add a trailing slash to enforce prefix matching.

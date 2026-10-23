@@ -1,6 +1,7 @@
 /* List object implementation */
 
 #include "Python.h"
+#include "anota_watch.h"
 #include "pycore_abstract.h"      // _PyIndex_Check()
 #include "pycore_interp.h"        // PyInterpreterState.list
 #include "pycore_object.h"        // _PyObject_GC_TRACK()
@@ -236,6 +237,11 @@ static PyObject *indexerr = NULL;
 PyObject *
 PyList_GetItem(PyObject *op, Py_ssize_t i)
 {
+    PyObject *anota_key = PyLong_FromSsize_t(i);
+    if (!anota_key) { return NULL; }
+    int anota_rc = _PyAnota_CheckReadMember(PyThreadState_Get(), (PyObject *)op, anota_key);
+    Py_DECREF(anota_key);
+    if (anota_rc < 0) { return NULL; }
     if (!PyList_Check(op)) {
         PyErr_BadInternalCall();
         return NULL;
@@ -257,6 +263,11 @@ int
 PyList_SetItem(PyObject *op, Py_ssize_t i,
                PyObject *newitem)
 {
+    PyObject *anota_key = PyLong_FromSsize_t(i);
+    if (!anota_key) { Py_XDECREF(newitem); return -1; }
+    int anota_rc = _PyAnota_CheckWriteMember(PyThreadState_Get(), (PyObject *)op, anota_key);
+    Py_DECREF(anota_key);
+    if (anota_rc < 0) { Py_XDECREF(newitem); return -1; }
     PyObject **p;
     if (!PyList_Check(op)) {
         Py_XDECREF(newitem);
@@ -277,6 +288,7 @@ PyList_SetItem(PyObject *op, Py_ssize_t i,
 static int
 ins1(PyListObject *self, Py_ssize_t where, PyObject *v)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 1) < 0) return -1;
     Py_ssize_t i, n = Py_SIZE(self);
     PyObject **items;
     if (v == NULL) {
@@ -316,6 +328,7 @@ PyList_Insert(PyObject *op, Py_ssize_t where, PyObject *newitem)
 static int
 app1(PyListObject *self, PyObject *v)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 1) < 0) return -1;
     Py_ssize_t n = PyList_GET_SIZE(self);
 
     assert (v != NULL);
@@ -373,6 +386,7 @@ list_dealloc(PyListObject *op)
 static PyObject *
 list_repr(PyListObject *v)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)v, 0) < 0) return NULL;
     Py_ssize_t i;
     PyObject *s;
     _PyUnicodeWriter writer;
@@ -435,6 +449,7 @@ list_length(PyListObject *a)
 static int
 list_contains(PyListObject *a, PyObject *el)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)a, 0) < 0) return -1;
     PyObject *item;
     Py_ssize_t i;
     int cmp;
@@ -451,6 +466,11 @@ list_contains(PyListObject *a, PyObject *el)
 static PyObject *
 list_item(PyListObject *a, Py_ssize_t i)
 {
+    PyObject *anota_key = PyLong_FromSsize_t(i);
+    if (!anota_key) { return NULL; }
+    int anota_rc = _PyAnota_CheckReadMember(PyThreadState_Get(), (PyObject *)a, anota_key);
+    Py_DECREF(anota_key);
+    if (anota_rc < 0) { return NULL; }
     if (!valid_index(i, Py_SIZE(a))) {
         if (indexerr == NULL) {
             indexerr = PyUnicode_FromString(
@@ -468,6 +488,7 @@ list_item(PyListObject *a, Py_ssize_t i)
 static PyObject *
 list_slice(PyListObject *a, Py_ssize_t ilow, Py_ssize_t ihigh)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)a, 0) < 0) return NULL;
     PyListObject *np;
     PyObject **src, **dest;
     Py_ssize_t i, len;
@@ -628,6 +649,7 @@ _list_clear(PyListObject *a)
 static int
 list_ass_slice(PyListObject *a, Py_ssize_t ilow, Py_ssize_t ihigh, PyObject *v)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)a, 1) < 0) return -1;
     /* Because [X]DECREF can recursively invoke list operations on
        this list, we must postpone all [X]DECREF activity until
        after the list is back in its canonical shape.  Therefore
@@ -744,6 +766,7 @@ PyList_SetSlice(PyObject *a, Py_ssize_t ilow, Py_ssize_t ihigh, PyObject *v)
 static PyObject *
 list_inplace_repeat(PyListObject *self, Py_ssize_t n)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 1) < 0) return NULL;
     PyObject **items;
     Py_ssize_t size, i, j, p;
 
@@ -783,6 +806,11 @@ list_inplace_repeat(PyListObject *self, Py_ssize_t n)
 static int
 list_ass_item(PyListObject *a, Py_ssize_t i, PyObject *v)
 {
+    PyObject *anota_key = PyLong_FromSsize_t(i);
+    if (!anota_key) {  return -1; }
+    int anota_rc = _PyAnota_CheckWriteMember(PyThreadState_Get(), (PyObject *)a, anota_key);
+    Py_DECREF(anota_key);
+    if (anota_rc < 0) {  return -1; }
     if (!valid_index(i, Py_SIZE(a))) {
         PyErr_SetString(PyExc_IndexError,
                         "list assignment index out of range");
@@ -824,6 +852,7 @@ static PyObject *
 list_clear_impl(PyListObject *self)
 /*[clinic end generated code: output=67a1896c01f74362 input=ca3c1646856742f6]*/
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 1) < 0) return NULL;
     _list_clear(self);
     Py_RETURN_NONE;
 }
@@ -872,6 +901,8 @@ static PyObject *
 list_extend(PyListObject *self, PyObject *iterable)
 /*[clinic end generated code: output=630fb3bca0c8e789 input=9ec5ba3a81be3a4d]*/
 {
+    if (_PyAnota_CheckAllMembers(iterable, 0) < 0) return NULL;
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 1) < 0) return NULL;
     PyObject *it;      /* iter(v) */
     Py_ssize_t m;                  /* size of self */
     Py_ssize_t n;                  /* guess for size of iterable */
@@ -1028,6 +1059,7 @@ static PyObject *
 list_pop_impl(PyListObject *self, Py_ssize_t index)
 /*[clinic end generated code: output=6bd69dcb3f17eca8 input=b83675976f329e6f]*/
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 1) < 0) return NULL;
     PyObject *v;
     int status;
 
@@ -2221,6 +2253,7 @@ static PyObject *
 list_sort_impl(PyListObject *self, PyObject *keyfunc, int reverse)
 /*[clinic end generated code: output=57b9f9c5e23fbe42 input=cb56cd179a713060]*/
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 1) < 0) return NULL;
     MergeState ms;
     Py_ssize_t nremaining;
     Py_ssize_t minrun;
@@ -2503,6 +2536,7 @@ static PyObject *
 list_reverse_impl(PyListObject *self)
 /*[clinic end generated code: output=482544fc451abea9 input=eefd4c3ae1bc9887]*/
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 1) < 0) return NULL;
     if (Py_SIZE(self) > 1)
         reverse_slice(self->ob_item, self->ob_item + Py_SIZE(self));
     Py_RETURN_NONE;
@@ -2511,6 +2545,7 @@ list_reverse_impl(PyListObject *self)
 int
 PyList_Reverse(PyObject *v)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)v, 1) < 0) return -1;
     PyListObject *self = (PyListObject *)v;
 
     if (v == NULL || !PyList_Check(v)) {
@@ -2525,6 +2560,7 @@ PyList_Reverse(PyObject *v)
 PyObject *
 PyList_AsTuple(PyObject *v)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)v, 0) < 0) return NULL;
     if (v == NULL || !PyList_Check(v)) {
         PyErr_BadInternalCall();
         return NULL;
@@ -2550,6 +2586,7 @@ list_index_impl(PyListObject *self, PyObject *value, Py_ssize_t start,
                 Py_ssize_t stop)
 /*[clinic end generated code: output=ec51b88787e4e481 input=40ec5826303a0eb1]*/
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 0) < 0) return NULL;
     Py_ssize_t i;
 
     if (start < 0) {
@@ -2589,6 +2626,7 @@ static PyObject *
 list_count(PyListObject *self, PyObject *value)
 /*[clinic end generated code: output=b1f5d284205ae714 input=3bdc3a5e6f749565]*/
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 0) < 0) return NULL;
     Py_ssize_t count = 0;
     Py_ssize_t i;
 
@@ -2624,6 +2662,7 @@ static PyObject *
 list_remove(PyListObject *self, PyObject *value)
 /*[clinic end generated code: output=f087e1951a5e30d1 input=2dc2ba5bb2fb1f82]*/
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 0) < 0) return NULL;
     Py_ssize_t i;
 
     for (i = 0; i < Py_SIZE(self); i++) {
@@ -2726,6 +2765,7 @@ static int
 list___init___impl(PyListObject *self, PyObject *iterable)
 /*[clinic end generated code: output=0f3c21379d01de48 input=b3f3fe7206af8f6b]*/
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 1) < 0) return -1;
     /* Verify list invariants established by PyType_GenericAlloc() */
     assert(0 <= Py_SIZE(self));
     assert(Py_SIZE(self) <= self->allocated || self->allocated == -1);
@@ -3190,6 +3230,7 @@ listiter_traverse(listiterobject *it, visitproc visit, void *arg)
 static PyObject *
 listiter_next(listiterobject *it)
 {
+    if (it->it_seq && _PyAnota_CheckAllMembers((PyObject *)it->it_seq, 0) < 0) return NULL;
     PyListObject *seq;
     PyObject *item;
 
@@ -3341,6 +3382,7 @@ listreviter_traverse(listreviterobject *it, visitproc visit, void *arg)
 static PyObject *
 listreviter_next(listreviterobject *it)
 {
+    if (it->it_seq && _PyAnota_CheckAllMembers((PyObject *)it->it_seq, 0) < 0) return NULL;
     PyObject *item;
     Py_ssize_t index;
     PyListObject *seq;

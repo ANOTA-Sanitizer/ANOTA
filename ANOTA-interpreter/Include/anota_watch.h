@@ -5,6 +5,7 @@ extern "C" {
 #endif
 
 #include "Python.h"
+PyAPI_FUNC(int) _PyAnotaWatch_IsController(PyObject *obj);
 
 /* Public-ish helper used by ceval and builtins to access the singleton
    ANOTA_WATCH object that exposes the Python API:
@@ -14,6 +15,8 @@ extern "C" {
        ANOTA_WATCH.CLEAR_ALL()
 */
 PyAPI_FUNC(PyObject *) _PyAnotaWatch_GetSingleton(void);
+PyAPI_FUNC(void) _PyAnotaWatch_ClearAll(void);
+PyAPI_FUNC(int) _PyAnota_CheckAllMembers(PyObject *obj, int write);
 
 /* Internal helpers used from the bytecode evaluator (ceval.c).
    They return 0 on success (access allowed), and -1 on policy

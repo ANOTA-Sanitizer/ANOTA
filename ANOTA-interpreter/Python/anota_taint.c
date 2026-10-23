@@ -1,5 +1,6 @@
 #include "Python.h"
 #include "anota_taint.h"
+#include "anota_policy.h"
 #include "pycore_pystate.h"  /* PyThreadState */
 #include <stdio.h>
 #include <string.h>
@@ -17,14 +18,18 @@
  *   taint_sinks:      { taint_id -> { callable -> True } }
  *   taint_default_write_sinks: { taint_id -> True }
  *
- * When tainted values flow together, ANOTA creates a derived taint id whose
- * policy bundle is the union of the source bundles. This keeps the runtime
- * object-centric while still supporting per-source sink/sanitizer policies.
+ * A label refers to a set of original sources. Derived labels never merge
+ * sanitizer permissions: a sanitizer removes only sources that registered it.
+ * Revoking a source invalidates its contribution to all derived labels.
  */
 
 static PyObject *taint_sanitizers = NULL;          /* { id -> { func -> True } } */
 static PyObject *taint_sinks = NULL;               /* { id -> { func -> True } } */
 static PyObject *taint_default_write_sinks = NULL; /* { id -> True } */
+/* Labels retain original sources; sanitizers remove only their own sources. */
+static PyObject *source_sets = NULL;    /* label -> frozenset(origin ids) */
+static PyObject *union_labels = NULL;   /* frozenset(origin ids) -> label */
+static PyObject *taint_records = NULL;  /* origin -> policy handle token */
 static Py_ssize_t next_taint_id = 1;
 
 #define ANOTA_DFSAN_NATIVE_LABEL_SLOTS 8
@@ -49,6 +54,10 @@ static int add_taint_id_to_set(PyObject *taint_ids, Py_ssize_t taint_id);
 static int
 ensure_state(void)
 {
+    if (source_sets == NULL) source_sets = PyDict_New();
+    if (union_labels == NULL) union_labels = PyDict_New();
+    if (taint_records == NULL) taint_records = PyDict_New();
+    if (!source_sets || !union_labels || !taint_records) return -1;
     if (taint_sanitizers == NULL) {
         taint_sanitizers = PyDict_New();
         if (taint_sanitizers == NULL) {
@@ -112,26 +121,23 @@ native_label_for_taint_id(Py_ssize_t taint_id)
 static int
 native_label_has_default_write_sink(unsigned int label)
 {
+    PyObject *ids = PySet_New(NULL);
+    if (!ids) return -1;
     for (int i = 0; i < ANOTA_DFSAN_NATIVE_LABEL_SLOTS; i++) {
-        Py_ssize_t taint_id;
-        int rc;
-
-        if ((label & (1u << i)) == 0) {
-            continue;
-        }
-        taint_id = native_label_taint_ids[i];
-        if (taint_id <= 0) {
-            continue;
-        }
-        rc = has_default_write_sink(taint_id);
-        if (rc < 0) {
-            return -1;
-        }
-        if (rc > 0) {
-            return 1;
+        if ((label & (1u << i)) && add_taint_id_to_set(ids, native_label_taint_ids[i]) < 0) {
+            Py_DECREF(ids); return -1;
         }
     }
-    return 0;
+    Py_ssize_t pos = 0;
+    PyObject *id;
+    Py_hash_t hash;
+    int rc = 0;
+    while (_PySet_NextEntry(ids, &pos, &id, &hash)) {
+        rc = has_default_write_sink(PyLong_AsSsize_t(id));
+        if (rc != 0) break;
+    }
+    Py_DECREF(ids);
+    return rc;
 }
 
 static int
@@ -161,29 +167,6 @@ get_taint_id(PyObject *obj)
         return 0;
     }
     return obj->ob_anota_taint_id;
-}
-
-static int
-ensure_taint_id(PyObject *obj, Py_ssize_t *out_taint_id)
-{
-    if (obj == NULL) {
-        PyErr_SetString(PyExc_TypeError, "ANOTA_TAINT requires a Python object");
-        return -1;
-    }
-    if (ensure_state() < 0) {
-        return -1;
-    }
-
-    if (obj->ob_anota_taint_id == 0) {
-        if (next_taint_id <= 0) {
-            PyErr_SetString(PyExc_OverflowError, "ANOTA taint id space exhausted");
-            return -1;
-        }
-        obj->ob_anota_taint_id = next_taint_id++;
-    }
-
-    *out_taint_id = obj->ob_anota_taint_id;
-    return 0;
 }
 
 static PyObject *
@@ -326,37 +309,6 @@ register_funcs_from_seq(PyObject *seq, PyObject *policy_map,
 }
 
 static int
-copy_policy_entries(PyObject *policy_map, Py_ssize_t source_id,
-                    Py_ssize_t target_id)
-{
-    PyObject *source_dict;
-    PyObject *target_dict;
-    PyObject *func;
-    PyObject *value;
-    Py_ssize_t pos = 0;
-
-    source_dict = get_policy_dict(policy_map, source_id);
-    if (source_dict == NULL) {
-        if (PyErr_Occurred()) {
-            return -1;
-        }
-        return 0;
-    }
-
-    target_dict = ensure_policy_dict(policy_map, target_id);
-    if (target_dict == NULL) {
-        return -1;
-    }
-
-    while (PyDict_Next(source_dict, &pos, &func, &value)) {
-        if (PyDict_SetItem(target_dict, func, value) < 0) {
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static int
 function_name_matches(PyObject *func, const char *name)
 {
     PyObject *name_obj;
@@ -401,7 +353,8 @@ is_sink_for_taint_id(Py_ssize_t taint_id, PyObject *func)
     if (rc <= 0) {
         return rc;
     }
-    return function_name_matches(func, "write");
+    return function_name_matches(func, "write") || function_name_matches(func, "writelines") ||
+           (PyCFunction_Check(func) && function_name_matches(func, "print"));
 }
 
 static int
@@ -411,41 +364,22 @@ is_sanitizer_for_taint_id(Py_ssize_t taint_id, PyObject *func)
 }
 
 static int
-add_taint_id_to_set(PyObject *taint_ids, Py_ssize_t taint_id)
+add_taint_id_to_set(PyObject *ids, Py_ssize_t id)
 {
-    PyObject *id_obj;
-    int rc;
-
-    if (taint_id <= 0) {
-        return 0;
+    if (id <= 0 || source_sets == NULL) return 0;
+    PyObject *key = PyLong_FromSsize_t(id);
+    if (!key) return -1;
+    PyObject *origins = PyDict_GetItemWithError(source_sets, key);
+    Py_DECREF(key);
+    if (!origins) return PyErr_Occurred() ? -1 : 0;
+    Py_ssize_t pos = 0;
+    PyObject *origin;
+    Py_hash_t hash;
+    while (_PySet_NextEntry(origins, &pos, &origin, &hash)) {
+        int active = PyDict_Contains(taint_records, origin);
+        if (active < 0 || (active && PySet_Add(ids, origin) < 0)) return -1;
     }
-
-    id_obj = taint_id_to_key(taint_id);
-    if (id_obj == NULL) {
-        return -1;
-    }
-    rc = PySet_Add(taint_ids, id_obj);
-    Py_DECREF(id_obj);
-    return rc;
-}
-
-static int
-tuple_contains_taint_id(PyObject *taint_ids, Py_ssize_t taint_id)
-{
-    PyObject *id_obj;
-    int rc;
-
-    if (taint_id <= 0) {
-        return 0;
-    }
-
-    id_obj = taint_id_to_key(taint_id);
-    if (id_obj == NULL) {
-        return -1;
-    }
-    rc = PySequence_Contains(taint_ids, id_obj);
-    Py_DECREF(id_obj);
-    return rc;
+    return 0;
 }
 
 static int
@@ -472,101 +406,127 @@ report_sink_violation(PyObject *func, PyObject *arg, PyObject *key)
     return -1;
 }
 
+/* Inspect builtin containers without calling user iterators or descriptors.
+ * A visited identity set handles cycles, aliases, and recursive containers. */
 static int
-check_arg_taint(PyObject *func, PyObject *arg, PyObject *key, PyObject *taint_ids)
+collect_object(PyObject *obj, PyObject *ids, PyObject *seen)
 {
-    Py_ssize_t taint_id = get_taint_id(arg);
-    int sink;
-
-    if (taint_id <= 0) {
-        return 0;
+    if (obj == NULL) return 0;
+    PyObject *key = PyLong_FromVoidPtr(obj);
+    if (!key) return -1;
+    int visited = PySet_Contains(seen, key);
+    if (visited || PySet_Add(seen, key) < 0) {
+        Py_DECREF(key);
+        return visited > 0 ? 0 : -1;
     }
-
-    sink = is_sink_for_taint_id(taint_id, func);
-    if (sink < 0) {
-        return -1;
+    Py_DECREF(key);
+    if (add_object_taint_to_set(ids, obj) < 0) return -1;
+    if (Py_EnterRecursiveCall(" while inspecting ANOTA taint")) return -1;
+    int rc = 0;
+    if (PyList_Check(obj) || PyTuple_Check(obj)) {
+        Py_ssize_t n = PyList_Check(obj) ? PyList_GET_SIZE(obj) : PyTuple_GET_SIZE(obj);
+        for (Py_ssize_t i = 0; i < n && rc == 0; i++) {
+            PyObject *item = PyList_Check(obj) ? PyList_GET_ITEM(obj, i) : PyTuple_GET_ITEM(obj, i);
+            rc = collect_object(item, ids, seen);
+        }
+    } else if (PyDict_Check(obj)) {
+        Py_ssize_t pos = 0;
+        PyObject *k, *v;
+        while (rc == 0 && PyDict_Next(obj, &pos, &k, &v)) {
+            rc = collect_object(k, ids, seen);
+            if (rc == 0) rc = collect_object(v, ids, seen);
+        }
+    } else if (PyAnySet_Check(obj)) {
+        Py_ssize_t pos = 0;
+        PyObject *item;
+        Py_hash_t hash;
+        while (rc == 0 && _PySet_NextEntry(obj, &pos, &item, &hash))
+            rc = collect_object(item, ids, seen);
     }
-    if (sink) {
-        return report_sink_violation(func, arg, key);
-    }
-    return add_taint_id_to_set(taint_ids, taint_id);
+    Py_LeaveRecursiveCall();
+    return rc;
 }
 
 static int
-append_callable_taint(PyObject *func, PyObject *taint_ids)
+collect_deep(PyObject *ids, PyObject *obj)
 {
-    return add_object_taint_to_set(taint_ids, func);
+    PyObject *seen = PySet_New(NULL);
+    if (!seen) return -1;
+    int rc = collect_object(obj, ids, seen);
+    Py_DECREF(seen);
+    return rc;
 }
 
 static int
-merge_policies_from_ids(Py_ssize_t target_id, PyObject *source_ids)
+check_arg_taint(PyObject *func, PyObject *arg, PyObject *key, PyObject *ids)
 {
-    Py_ssize_t n = PyTuple_GET_SIZE(source_ids);
-
-    for (Py_ssize_t i = 0; i < n; i++) {
-        PyObject *id_obj = PyTuple_GET_ITEM(source_ids, i);
-        Py_ssize_t source_id = PyLong_AsSsize_t(id_obj);
-        int default_write;
-
-        if (source_id == -1 && PyErr_Occurred()) {
-            return -1;
-        }
-        if (copy_policy_entries(taint_sanitizers, source_id, target_id) < 0) {
-            return -1;
-        }
-        if (copy_policy_entries(taint_sinks, source_id, target_id) < 0) {
-            return -1;
-        }
-        default_write = has_default_write_sink(source_id);
-        if (default_write < 0) {
-            return -1;
-        }
-        if (default_write > 0 && mark_default_write_sink(target_id) < 0) {
-            return -1;
-        }
+    PyObject *sources = PySet_New(NULL);
+    if (!sources) return -1;
+    int rc = collect_deep(sources, arg);
+    Py_ssize_t pos = 0;
+    PyObject *origin;
+    Py_hash_t hash;
+    while (rc == 0 && _PySet_NextEntry(sources, &pos, &origin, &hash)) {
+        int sink = is_sink_for_taint_id(PyLong_AsSsize_t(origin), func);
+        if (sink < 0) rc = -1;
+        else if (sink) rc = report_sink_violation(func, arg, key);
+        else rc = PySet_Add(ids, origin);
     }
+    Py_DECREF(sources);
+    return rc;
+}
+
+static int
+append_callable_taint(PyObject *func, PyObject *ids)
+{
+    if (add_object_taint_to_set(ids, func) < 0) return -1;
+    /* Bound C/Python methods can consume their receiver without an explicit
+       positional argument (e.g. secret.upper(), list.copy()). */
+    PyObject *owner = PyCFunction_Check(func) ? PyCFunction_GET_SELF(func) :
+                      PyMethod_Check(func) ? PyMethod_GET_SELF(func) : NULL;
+    if (owner && !PyModule_Check(owner)) return check_arg_taint(func, owner, NULL, ids);
     return 0;
 }
 
 static int
-apply_sources_to_target(PyObject *target, PyObject *source_ids)
+apply_sources_to_target(PyObject *target, PyObject *sources)
 {
-    Py_ssize_t n;
-    Py_ssize_t target_id;
-
-    if (target == NULL || source_ids == NULL) {
+    if (!target || !sources) return 0;
+    /* Never poison process-wide singleton return values such as print's None. */
+    if (target == Py_None || PyBool_Check(target) || target == Py_Ellipsis || target == Py_NotImplemented)
         return 0;
+    if (ensure_state() < 0) return -1;
+    PyObject *ids = PySet_New(NULL);
+    if (!ids) return -1;
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(sources); i++) {
+        if (add_taint_id_to_set(ids, PyLong_AsSsize_t(PyTuple_GET_ITEM(sources, i))) < 0) {
+            Py_DECREF(ids); return -1;
+        }
     }
-    if (ensure_state() < 0) {
-        return -1;
-    }
-
-    n = PyTuple_GET_SIZE(source_ids);
-    if (n == 0) {
+    if (PySet_GET_SIZE(ids) == 0) {
         target->ob_anota_taint_id = 0;
-        return 0;
+        Py_DECREF(ids); return 0;
     }
-    if (n == 1) {
-        PyObject *id_obj = PyTuple_GET_ITEM(source_ids, 0);
-        target_id = PyLong_AsSsize_t(id_obj);
-        if (target_id == -1 && PyErr_Occurred()) {
-            return -1;
-        }
-        target->ob_anota_taint_id = target_id;
-        return 0;
+    PyObject *frozen = PyFrozenSet_New(ids);
+    Py_DECREF(ids);
+    if (!frozen) return -1;
+    PyObject *label = PyDict_GetItemWithError(union_labels, frozen);
+    if (label) {
+        target->ob_anota_taint_id = PyLong_AsSsize_t(label);
+        Py_DECREF(frozen); return 0;
     }
-
-    if (next_taint_id <= 0) {
-        PyErr_SetString(PyExc_OverflowError, "ANOTA taint id space exhausted");
+    if (PyErr_Occurred() || next_taint_id == PY_SSIZE_T_MAX) {
+        Py_DECREF(frozen);
+        if (!PyErr_Occurred()) PyErr_SetString(PyExc_OverflowError, "ANOTA taint id space exhausted");
         return -1;
     }
-    target_id = next_taint_id++;
-
-    if (merge_policies_from_ids(target_id, source_ids) < 0) {
-        return -1;
-    }
-    target->ob_anota_taint_id = target_id;
-    return 0;
+    label = PyLong_FromSsize_t(next_taint_id++);
+    if (!label) { Py_DECREF(frozen); return -1; }
+    int rc = PyDict_SetItem(source_sets, label, frozen);
+    if (rc == 0) rc = PyDict_SetItem(union_labels, frozen, label);
+    if (rc == 0) target->ob_anota_taint_id = PyLong_AsSsize_t(label);
+    Py_DECREF(label); Py_DECREF(frozen);
+    return rc;
 }
 
 static PyObject *
@@ -686,35 +646,155 @@ filter_sanitized_sources(PyObject *func, PyObject *taint_sources)
 
 /* --- public registration helpers -------------------------------------- */
 
+static int
+remove_source(PyObject *token)
+{
+    PyObject *id = PyList_GET_ITEM(token, 1);
+    PyObject *maps[] = {taint_sanitizers, taint_sinks, taint_default_write_sinks, taint_records};
+    for (int i = 0; i < 4; i++) {
+        if (PyDict_DelItem(maps[i], id) < 0) {
+            if (PyErr_ExceptionMatches(PyExc_KeyError)) PyErr_Clear();
+            else return -1;
+        }
+    }
+    return 0;
+}
+
+static PyObject *
+register_source(PyObject *obj, PyObject *sanitizers, PyObject *sinks)
+{
+    if (ensure_state() < 0) return NULL;
+    if (next_taint_id == PY_SSIZE_T_MAX) {
+        PyErr_SetString(PyExc_OverflowError, "ANOTA taint id space exhausted"); return NULL;
+    }
+    Py_ssize_t id = next_taint_id++;
+    PyObject *token = Py_BuildValue("[OnO]", Py_True, id, obj);
+    if (!token) return NULL;
+    PyObject *id_obj = PyList_GET_ITEM(token, 1);
+    PyObject *singleton = PyTuple_Pack(1, id_obj);
+    PyObject *origins = singleton ? PyFrozenSet_New(singleton) : NULL;
+    Py_XDECREF(singleton);
+    PyObject *handle = NULL;
+    if (!origins) goto fail;
+    if (register_funcs_from_seq(sanitizers, taint_sanitizers, id, "sanitization") < 0 ||
+        register_funcs_from_seq(sinks, taint_sinks, id, "Sink") < 0 ||
+        ((sinks == NULL || sinks == Py_None) && mark_default_write_sink(id) < 0) ||
+        PyDict_SetItem(source_sets, id_obj, origins) < 0 ||
+        PyDict_SetItem(union_labels, origins, id_obj) < 0 ||
+        PyDict_SetItem(taint_records, id_obj, token) < 0) goto fail;
+    handle = _PyAnotaPolicy_New(token, remove_source);
+    if (!handle) goto fail;
+    PyObject *sources = Py_BuildValue("(nn)", get_taint_id(obj), id);
+    if (!sources) goto fail;
+    int rc = apply_sources_to_target(obj, sources);
+    Py_DECREF(sources);
+    if (rc < 0) goto fail;
+    Py_DECREF(origins); Py_DECREF(token);
+    return handle;
+ fail: {
+    PyObject *type, *value, *tb;
+    PyErr_Fetch(&type, &value, &tb);
+    remove_source(token);
+    PyErr_Clear();
+    PyErr_Restore(type, value, tb);
+    Py_XDECREF(handle); Py_XDECREF(origins); Py_DECREF(token);
+    return NULL;
+ }
+}
+
 int
 _PyAnotaTaint_Register(PyObject *obj, PyObject *sanitizers, PyObject *sinks)
 {
-    Py_ssize_t taint_id;
-
-    if (ensure_taint_id(obj, &taint_id) < 0) {
-        return -1;
-    }
-
-    /* write() as the default sink. */
-    if (mark_default_write_sink(taint_id) < 0) {
-        return -1;
-    }
-
-    if (register_funcs_from_seq(sanitizers, taint_sanitizers,
-                                taint_id, "sanitization") < 0) {
-        return -1;
-    }
-    if (register_funcs_from_seq(sinks, taint_sinks,
-                                taint_id, "Sink") < 0) {
-        return -1;
-    }
+    PyObject *handle = register_source(obj, sanitizers, sinks);
+    if (!handle) return -1;
+    Py_DECREF(handle);
     return 0;
 }
 
 int
 _PyAnotaTaint_IsTainted(PyObject *obj)
 {
-    return get_taint_id(obj) > 0;
+    if (!source_sets || !taint_records || PyDict_GET_SIZE(taint_records) == 0) return 0;
+    PyObject *ids = PySet_New(NULL);
+    if (!ids) { PyErr_Clear(); return 0; }
+    int rc = collect_deep(ids, obj);
+    int tainted = rc == 0 && PySet_GET_SIZE(ids) > 0;
+    Py_DECREF(ids);
+    if (rc < 0) PyErr_Clear();
+    return tainted;
+}
+
+void
+_PyAnotaTaint_ClearAll(void)
+{
+    if (!taint_records) return;
+    Py_ssize_t pos = 0;
+    PyObject *id, *token;
+    while (PyDict_Next(taint_records, &pos, &id, &token)) _PyAnotaPolicy_Invalidate(token);
+    PyDict_Clear(taint_records);
+    PyDict_Clear(taint_sanitizers);
+    PyDict_Clear(taint_sinks);
+    PyDict_Clear(taint_default_write_sinks);
+    PyDict_Clear(source_sets);
+    PyDict_Clear(union_labels);
+    /* Never recycle source ids or native bits: stale object/shadow labels must
+       not acquire the policies of a subsequent request. */
+    native_sink_violation_pending = 0;
+}
+
+static PyObject *
+taint_clear(PyObject *self, PyObject *obj)
+{
+    PyObject *ids = PySet_New(NULL);
+    if (!ids) return NULL;
+    if (collect_deep(ids, obj) < 0) { Py_DECREF(ids); return NULL; }
+    Py_ssize_t pos = 0;
+    PyObject *id;
+    Py_hash_t hash;
+    while (_PySet_NextEntry(ids, &pos, &id, &hash)) {
+        PyObject *token = PyDict_GetItemWithError(taint_records, id);
+        if (!token) continue;
+        Py_INCREF(token);
+        if (remove_source(token) < 0) { Py_DECREF(token); Py_DECREF(ids); return NULL; }
+        _PyAnotaPolicy_Invalidate(token);
+        Py_DECREF(token);
+    }
+    Py_DECREF(ids);
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+taint_clear_all(PyObject *self, PyObject *unused)
+{
+    _PyAnotaTaint_ClearAll();
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+taint_is_tainted(PyObject *self, PyObject *obj)
+{
+    return PyBool_FromLong(_PyAnotaTaint_IsTainted(obj));
+}
+
+static PyMethodDef taint_methods[] = {
+    {"CLEAR", taint_clear, METH_O, "Revoke the sources reaching this object, including container members."},
+    {"CLEAR_ALL", taint_clear_all, METH_NOARGS, "Revoke all taint sources, including derived labels."},
+    {"IS_TAINTED", taint_is_tainted, METH_O, "Inspect active taint, including builtin container members."},
+    {NULL, NULL}
+};
+static PyTypeObject Taint_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "ANOTA_TAINT",
+    .tp_basicsize = sizeof(PyObject),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_call = _PyAnota_Taint,
+    .tp_methods = taint_methods,
+};
+PyObject *
+_PyAnotaTaint_GetSingleton(void)
+{
+    if (PyType_Ready(&Taint_Type) < 0) return NULL;
+    return PyObject_New(PyObject, &Taint_Type);
 }
 
 int
@@ -885,12 +965,10 @@ result_supports_precise_native_taint(PyObject *result)
 static int
 apply_precise_native_postcall(PyObject *func,
                               PyObject *result,
-                              PyObject *survivors)
+                              PyObject *Py_UNUSED(survivors))
 {
     PyObject *taint_ids;
     PyObject *sources;
-    Py_ssize_t callable_taint_id;
-    int rc;
 
     if (!func_is_external_c_extension(func) ||
         !result_supports_precise_native_taint(result) ||
@@ -908,13 +986,7 @@ apply_precise_native_postcall(PyObject *func,
         return -1;
     }
 
-    callable_taint_id = get_taint_id(func);
-    rc = tuple_contains_taint_id(survivors, callable_taint_id);
-    if (rc < 0) {
-        Py_DECREF(taint_ids);
-        return -1;
-    }
-    if (rc > 0 && add_taint_id_to_set(taint_ids, callable_taint_id) < 0) {
+    if (add_object_taint_to_set(taint_ids, func) < 0) {
         Py_DECREF(taint_ids);
         return -1;
     }
@@ -924,6 +996,10 @@ apply_precise_native_postcall(PyObject *func,
         return -1;
     }
 
+    PyObject *filtered = filter_sanitized_sources(func, sources);
+    Py_DECREF(sources);
+    sources = filtered;
+    if (sources == NULL) return -1;
     if (apply_sources_to_target(result, sources) < 0) {
         Py_DECREF(sources);
         return -1;
@@ -955,11 +1031,7 @@ _PyAnota_Taint(PyObject *self, PyObject *args, PyObject *kwds)
         return NULL;
     }
 
-    if (_PyAnotaTaint_Register(obj, sanitization, sink) < 0) {
-        return NULL;
-    }
-
-    Py_RETURN_NONE;
+    return register_source(obj, sanitization, sink);
 }
 
 /* --- sink checks for various call paths ------------------------------- */
@@ -974,6 +1046,8 @@ _PyAnotaTaint_CheckVectorcall(PyThreadState *tstate,
 {
     (void)tstate;
     (void)kwnames;
+    if (_PyAnotaPolicy_IsControl(func) || !taint_records || PyDict_GET_SIZE(taint_records) == 0)
+        return PyTuple_New(0);
     return collect_vectorcall_sources(func, stack, nargs + nkwargs);
 }
 
@@ -984,6 +1058,8 @@ _PyAnotaTaint_CheckTupleDictCall(PyThreadState *tstate,
                                  PyObject *kwargs_dict)
 {
     (void)tstate;
+    if (_PyAnotaPolicy_IsControl(func) || !taint_records || PyDict_GET_SIZE(taint_records) == 0)
+        return PyTuple_New(0);
     return collect_tupledict_sources(func, args_tuple, kwargs_dict);
 }
 
@@ -995,11 +1071,18 @@ _PyAnotaTaint_PostCall(PyObject *func, PyObject *result, PyObject *taint_sources
     PyObject *survivors;
     int precise_native;
 
-    if (result == NULL || taint_sources == NULL) {
+    if (result == NULL || taint_sources == NULL || _PyAnotaPolicy_IsControl(func) ||
+        !taint_records || PyDict_GET_SIZE(taint_records) == 0) {
         return;
     }
 
-    survivors = filter_sanitized_sources(func, taint_sources);
+    PyObject *all = PySet_New(taint_sources);
+    if (!all) { PyErr_Clear(); return; }
+    if (collect_deep(all, result) < 0) { Py_DECREF(all); PyErr_Clear(); return; }
+    PyObject *combined = build_source_tuple(all);
+    if (!combined) { PyErr_Clear(); return; }
+    survivors = filter_sanitized_sources(func, combined);
+    Py_DECREF(combined);
     if (survivors == NULL) {
         PyErr_Clear();
         return;
@@ -1034,34 +1117,7 @@ _PyAnotaTaint_PostCall(PyObject *func, PyObject *result, PyObject *taint_sources
 void
 _PyAnotaTaint_Propagate(PyObject *source, PyObject *target)
 {
-    PyObject *taint_ids;
-
-    if (source == NULL || target == NULL || !_PyAnotaTaint_IsTainted(source)) {
-        return;
-    }
-
-    taint_ids = PyTuple_New(1);
-    if (taint_ids == NULL) {
-        PyErr_Clear();
-        return;
-    }
-    {
-        PyObject *id_obj = taint_id_to_key(get_taint_id(source));
-        if (id_obj == NULL) {
-            Py_DECREF(taint_ids);
-            PyErr_Clear();
-            return;
-        }
-        PyTuple_SET_ITEM(taint_ids, 0, id_obj);
-    }
-
-    if (apply_sources_to_target(target, taint_ids) == 0) {
-        PySys_FormatStderr("ANOTA_TAINT propagation: %R -> %R\n", source, target);
-    }
-    else {
-        PyErr_Clear();
-    }
-    Py_DECREF(taint_ids);
+    _PyAnotaTaint_PropagateBinary(source, NULL, target);
 }
 
 void
@@ -1069,9 +1125,7 @@ _PyAnotaTaint_PropagateBinary(PyObject *left, PyObject *right, PyObject *result)
 {
     PyObject *taint_ids;
 
-    if (result == NULL) {
-        return;
-    }
+    if (result == NULL || !taint_records || PyDict_GET_SIZE(taint_records) == 0) return;
 
     taint_ids = PySet_New(NULL);
     if (taint_ids == NULL) {
@@ -1079,9 +1133,9 @@ _PyAnotaTaint_PropagateBinary(PyObject *left, PyObject *right, PyObject *result)
         return;
     }
 
-    if (add_object_taint_to_set(taint_ids, left) < 0 ||
-        add_object_taint_to_set(taint_ids, right) < 0 ||
-        add_object_taint_to_set(taint_ids, result) < 0) {
+    if (collect_deep(taint_ids, left) < 0 ||
+        collect_deep(taint_ids, right) < 0 ||
+        collect_deep(taint_ids, result) < 0) {
         Py_DECREF(taint_ids);
         PyErr_Clear();
         return;
@@ -1109,3 +1163,7 @@ _PyAnotaTaint_PropagateBinary(PyObject *left, PyObject *right, PyObject *result)
         Py_DECREF(sources);
     }
 }
+
+int
+_PyAnotaTaint_IsController(PyObject *obj)
+{ return Py_TYPE(obj) == &Taint_Type; }

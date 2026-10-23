@@ -23,15 +23,12 @@ pub struct Options {
 
 /// Build the project
 fn build(opts: &Options) -> Result<(), anyhow::Error> {
-    let mut args = vec!["build"];
+    let mut args = vec!["build", "--locked"];
     if opts.release {
         args.push("--release")
     }
-    let status = Command::new("cargo")
-        .args(&args)
-        .status()
-        .expect("failed to build userspace");
-    assert!(status.success());
+    let status = Command::new("cargo").args(&args).status()?;
+    anyhow::ensure!(status.success(), "userspace build failed with {status}");
     Ok(())
 }
 
@@ -55,6 +52,8 @@ pub fn run(opts: Options) -> Result<(), anyhow::Error> {
     // configure args
     let mut args: Vec<_> = opts.runner.trim().split_terminator(' ').collect();
     args.push(bin_path.as_str());
+    let bpf_path = format!("target/{}/{profile}/syscall-tracepoint", opts.bpf_target);
+    args.extend(["--bpf", bpf_path.as_str()]);
     args.append(&mut run_args);
 
     // run the command

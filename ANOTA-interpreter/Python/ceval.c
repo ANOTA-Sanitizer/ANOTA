@@ -4593,6 +4593,7 @@ main_loop:
                without conversion. */
             if (conv_fn != NULL) {
                 result = conv_fn(value);
+                if (result) _PyAnotaTaint_Propagate(value, result);
                 Py_DECREF(value);
                 if (result == NULL) {
                     Py_XDECREF(fmt_spec);
@@ -4612,6 +4613,7 @@ main_loop:
             } else {
                 /* Actually call format(). */
                 result = PyObject_Format(value, fmt_spec);
+                if (result) _PyAnotaTaint_PropagateBinary(value, fmt_spec, result);
                 Py_DECREF(value);
                 Py_XDECREF(fmt_spec);
                 if (result == NULL) {

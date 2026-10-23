@@ -111,6 +111,7 @@ converting the dict to the combined table.
 #define PyDict_MINSIZE 8
 
 #include "Python.h"
+#include "anota_watch.h"
 #include "pycore_bitutils.h" // _Py_bit_length
 #include "pycore_gc.h"       // _PyObject_GC_IS_TRACKED()
 #include "pycore_object.h"   // _PyObject_GC_TRACK()
@@ -1505,6 +1506,7 @@ _PyDict_GetItem_KnownHash(PyObject *op, PyObject *key, Py_hash_t hash)
 PyObject *
 PyDict_GetItemWithError(PyObject *op, PyObject *key)
 {
+    if (_PyAnota_CheckReadMember(PyThreadState_Get(), (PyObject *)op, key) < 0) return NULL;
     Py_ssize_t ix;
     Py_hash_t hash;
     PyDictObject*mp = (PyDictObject *)op;
@@ -1599,6 +1601,7 @@ _PyDict_LoadGlobal(PyDictObject *globals, PyDictObject *builtins, PyObject *key)
 int
 PyDict_SetItem(PyObject *op, PyObject *key, PyObject *value)
 {
+    if (_PyAnota_CheckWriteMember(PyThreadState_Get(), (PyObject *)op, key) < 0) return -1;
     PyDictObject *mp;
     Py_hash_t hash;
     if (!PyDict_Check(op)) {
@@ -1673,6 +1676,7 @@ delitem_common(PyDictObject *mp, Py_hash_t hash, Py_ssize_t ix,
 int
 PyDict_DelItem(PyObject *op, PyObject *key)
 {
+    if (_PyAnota_CheckWriteMember(PyThreadState_Get(), (PyObject *)op, key) < 0) return -1;
     Py_hash_t hash;
     assert(key);
     if (!PyUnicode_CheckExact(key) ||
@@ -2093,6 +2097,7 @@ dict_dealloc(PyDictObject *mp)
 static PyObject *
 dict_repr(PyDictObject *mp)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)mp, 0) < 0) return NULL;
     Py_ssize_t i;
     PyObject *key = NULL, *value = NULL;
     _PyUnicodeWriter writer;
@@ -2182,6 +2187,7 @@ dict_length(PyDictObject *mp)
 static PyObject *
 dict_subscript(PyDictObject *mp, PyObject *key)
 {
+    if (_PyAnota_CheckReadMember(PyThreadState_Get(), (PyObject *)mp, key) < 0) return NULL;
     Py_ssize_t ix;
     Py_hash_t hash;
     PyObject *value;
@@ -2443,6 +2449,7 @@ dict_update_common(PyObject *self, PyObject *args, PyObject *kwds,
 static PyObject *
 dict_update(PyObject *self, PyObject *args, PyObject *kwds)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 1) < 0) return NULL;
     if (dict_update_common(self, args, kwds, "update") != -1)
         Py_RETURN_NONE;
     return NULL;
@@ -2546,6 +2553,7 @@ Return:
 static int
 dict_merge(PyObject *a, PyObject *b, int override)
 {
+    if (_PyAnota_CheckAllMembers(a, 1) < 0 || _PyAnota_CheckAllMembers(b, 0) < 0) return -1;
     PyDictObject *mp, *other;
     Py_ssize_t i, n;
     PyDictKeyEntry *entry, *ep0;
@@ -2748,6 +2756,7 @@ dict_copy(PyDictObject *mp, PyObject *Py_UNUSED(ignored))
 PyObject *
 PyDict_Copy(PyObject *o)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)o, 0) < 0) return NULL;
     PyObject *copy;
     PyDictObject *mp;
     Py_ssize_t i, n;
@@ -2851,6 +2860,7 @@ PyDict_Size(PyObject *mp)
 PyObject *
 PyDict_Keys(PyObject *mp)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)mp, 0) < 0) return NULL;
     if (mp == NULL || !PyDict_Check(mp)) {
         PyErr_BadInternalCall();
         return NULL;
@@ -2861,6 +2871,7 @@ PyDict_Keys(PyObject *mp)
 PyObject *
 PyDict_Values(PyObject *mp)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)mp, 0) < 0) return NULL;
     if (mp == NULL || !PyDict_Check(mp)) {
         PyErr_BadInternalCall();
         return NULL;
@@ -2871,6 +2882,7 @@ PyDict_Values(PyObject *mp)
 PyObject *
 PyDict_Items(PyObject *mp)
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)mp, 0) < 0) return NULL;
     if (mp == NULL || !PyDict_Check(mp)) {
         PyErr_BadInternalCall();
         return NULL;
@@ -2997,6 +3009,7 @@ static PyObject *
 dict_get_impl(PyDictObject *self, PyObject *key, PyObject *default_value)
 /*[clinic end generated code: output=bba707729dee05bf input=279ddb5790b6b107]*/
 {
+    if (_PyAnota_CheckReadMember(PyThreadState_Get(), (PyObject *)self, key) < 0) return NULL;
     PyObject *val = NULL;
     Py_hash_t hash;
     Py_ssize_t ix;
@@ -3035,7 +3048,9 @@ PyDict_SetDefault(PyObject *d, PyObject *key, PyObject *defaultobj)
         if (hash == -1)
             return NULL;
     }
+    if (_PyAnota_CheckReadMember(PyThreadState_Get(), d, key) < 0) return NULL;
     if (mp->ma_keys == Py_EMPTY_KEYS) {
+        if (_PyAnota_CheckWriteMember(PyThreadState_Get(), d, key) < 0) return NULL;
         if (insert_to_emptydict(mp, key, hash, defaultobj) < 0) {
             return NULL;
         }
@@ -3051,6 +3066,8 @@ PyDict_SetDefault(PyObject *d, PyObject *key, PyObject *defaultobj)
     if (ix == DKIX_ERROR)
         return NULL;
 
+    if ((ix == DKIX_EMPTY || value == NULL) &&
+        _PyAnota_CheckWriteMember(PyThreadState_Get(), d, key) < 0) return NULL;
     if (_PyDict_HasSplitTable(mp) &&
         ((ix >= 0 && value == NULL && mp->ma_used != ix) ||
          (ix == DKIX_EMPTY && mp->ma_used != mp->ma_keys->dk_nentries))) {
@@ -3125,6 +3142,7 @@ dict_setdefault_impl(PyDictObject *self, PyObject *key,
                      PyObject *default_value)
 /*[clinic end generated code: output=f8c1101ebf69e220 input=0f063756e815fd9d]*/
 {
+    if (_PyAnota_CheckReadMember(PyThreadState_Get(), (PyObject *)self, key) < 0) return NULL;
     PyObject *val;
 
     val = PyDict_SetDefault((PyObject *)self, key, default_value);
@@ -3135,6 +3153,7 @@ dict_setdefault_impl(PyDictObject *self, PyObject *key,
 static PyObject *
 dict_clear(PyDictObject *mp, PyObject *Py_UNUSED(ignored))
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)mp, 1) < 0) return NULL;
     PyDict_Clear((PyObject *)mp);
     Py_RETURN_NONE;
 }
@@ -3156,6 +3175,8 @@ static PyObject *
 dict_pop_impl(PyDictObject *self, PyObject *key, PyObject *default_value)
 /*[clinic end generated code: output=3abb47b89f24c21c input=e221baa01044c44c]*/
 {
+    if (_PyAnota_CheckReadMember(PyThreadState_Get(), (PyObject *)self, key) < 0) return NULL;
+    if (_PyAnota_CheckWriteMember(PyThreadState_Get(), (PyObject *)self, key) < 0) return NULL;
     return _PyDict_Pop((PyObject*)self, key, default_value);
 }
 
@@ -3172,6 +3193,8 @@ static PyObject *
 dict_popitem_impl(PyDictObject *self)
 /*[clinic end generated code: output=e65fcb04420d230d input=1c38a49f21f64941]*/
 {
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 0) < 0) return NULL;
+    if (_PyAnota_CheckAllMembers((PyObject *)self, 1) < 0) return NULL;
     Py_ssize_t i, j;
     PyDictKeyEntry *ep0, *ep;
     PyObject *res;
@@ -3777,6 +3800,7 @@ dictiter_iternextkey(dictiterobject *di)
                         "dictionary keys changed during iteration");
         goto fail;
     }
+    if (_PyAnota_CheckReadMember(PyThreadState_Get(), (PyObject *)d, key) < 0) return NULL;
     di->di_pos = i+1;
     di->len--;
     Py_INCREF(key);
@@ -3864,6 +3888,7 @@ dictiter_iternextvalue(dictiterobject *di)
                         "dictionary keys changed during iteration");
         goto fail;
     }
+    if (_PyAnota_CheckReadMember(PyThreadState_Get(), (PyObject *)d, DK_ENTRIES(d->ma_keys)[i].me_key) < 0) return NULL;
     di->di_pos = i+1;
     di->len--;
     Py_INCREF(value);
@@ -3953,6 +3978,7 @@ dictiter_iternextitem(dictiterobject *di)
                         "dictionary keys changed during iteration");
         goto fail;
     }
+    if (_PyAnota_CheckReadMember(PyThreadState_Get(), (PyObject *)d, key) < 0) return NULL;
     di->di_pos = i+1;
     di->len--;
     Py_INCREF(key);
@@ -4063,6 +4089,7 @@ dictreviter_iternext(dictiterobject *di)
         key = entry_ptr->me_key;
         value = entry_ptr->me_value;
     }
+    if (_PyAnota_CheckReadMember(PyThreadState_Get(), (PyObject *)d, key) < 0) return NULL;
     di->di_pos = i-1;
     di->len--;
 

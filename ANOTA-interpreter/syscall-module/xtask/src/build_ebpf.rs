@@ -43,7 +43,9 @@ pub fn build_ebpf(opts: Options) -> Result<(), anyhow::Error> {
     let dir = PathBuf::from("syscall-tracepoint-ebpf");
     let target = format!("--target={}", opts.target);
     let mut args = vec![
+        "+nightly",
         "build",
+        "--locked",
         target.as_str(),
         "-Z",
         "build-std=core",
@@ -60,8 +62,7 @@ pub fn build_ebpf(opts: Options) -> Result<(), anyhow::Error> {
         .current_dir(dir)
         .env_remove("RUSTUP_TOOLCHAIN")
         .args(&args)
-        .status()
-        .expect("failed to build bpf program");
-    assert!(status.success());
+        .status()?;
+    anyhow::ensure!(status.success(), "eBPF build failed with {status}");
     Ok(())
 }

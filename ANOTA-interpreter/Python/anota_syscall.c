@@ -1,12 +1,15 @@
 #include "Python.h"
 #include <ctype.h>
 #include <string.h>
+#include <stdlib.h>
 #include "anota_syscall.h"
+#include "anota_policy.h"
 
 #ifndef MS_WINDOWS
 #  include <sys/types.h>
 #  include <sys/socket.h>
 #  include <sys/un.h>
+#  include <sys/time.h>
 #  include <unistd.h>
 #endif
 #include <errno.h>
@@ -21,6 +24,8 @@ typedef enum {
     POLICY_ENTRY_DOMAIN = 3,
     POLICY_ENTRY_IP = 4,
     POLICY_ENTRY_PROTOCOL = 5,
+    POLICY_ENTRY_SCHEME = 6,
+    POLICY_ENTRY_HOST = 7,
 } PolicyEntryKind;
 
 #define POLICY_ENTRY_BASE_MASK 0xFF
@@ -30,58 +35,68 @@ typedef enum {
 #  define ANOTA_SYSCALL_SOCKET_PATH "/tmp/anota_syscall.sock"
 #endif
 
+/* Acknowledged, bounded requests. Policy violations only log; transport
+ * failures raise so callers cannot mistake an inactive monitor for success. */
+static int monitor_enabled = 0;
+static long monitor_target_pid = 0;
+static long monitor_origin_pid = 0;
+static int monitor_syncing = 0;
+
 static int
 send_monitor_command(const char *command, Py_ssize_t length)
 {
 #ifndef MS_WINDOWS
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) {
-        PyErr_SetFromErrno(PyExc_OSError);
-        return -1;
-    }
+    const char *path = getenv("ANOTA_SYSCALL_SOCKET");
+    if (path == NULL || *path == '\0') path = ANOTA_SYSCALL_SOCKET_PATH;
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    size_t path_len = strlen(ANOTA_SYSCALL_SOCKET_PATH);
-    if (path_len >= sizeof(addr.sun_path)) {
-        close(fd);
-        PyErr_SetString(PyExc_RuntimeError,
-                        "ANOTA_SYSCALL socket path is too long");
+    if (strlen(path) >= sizeof(addr.sun_path)) {
+        PyErr_SetString(PyExc_ValueError, "ANOTA_SYSCALL socket path is too long");
         return -1;
     }
-    memcpy(addr.sun_path, ANOTA_SYSCALL_SOCKET_PATH, path_len + 1);
-
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        PyErr_SetFromErrnoWithFilename(PyExc_OSError,
-                                       ANOTA_SYSCALL_SOCKET_PATH);
-        return -1;
-    }
-
-    const char *cursor = command;
-    Py_ssize_t remaining = length;
-    while (remaining > 0) {
-        ssize_t wrote = send(fd, cursor, remaining, 0);
-        if (wrote < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            close(fd);
-            PyErr_SetFromErrno(PyExc_OSError);
-            return -1;
-        }
-        cursor += wrote;
-        remaining -= wrote;
-    }
-
-    /* Best-effort read response (ignored). */
-    char response[64];
-    (void)recv(fd, response, sizeof(response), 0);
-    close(fd);
-    return 0;
+    memcpy(addr.sun_path, path, strlen(path) + 1);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return PyErr_SetFromErrno(PyExc_OSError), -1;
+    struct timeval timeout = {5, 0};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0 ||
+        connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) goto io_error;
+    while (length > 0) {
+#ifdef MSG_NOSIGNAL
+        ssize_t n = send(fd, command, (size_t)length, MSG_NOSIGNAL);
 #else
-    PyErr_SetString(PyExc_NotImplementedError,
-                    "ANOTA_SYSCALL_SIGNAL_* is only available on Unix platforms");
+        ssize_t n = send(fd, command, (size_t)length, 0);
+#endif
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { if (n == 0) errno = EPIPE; goto io_error; }
+        command += n; length -= n;
+    }
+    char response[4096];
+    size_t used = 0;
+    while (used < sizeof(response) - 1) {
+        ssize_t n = recv(fd, response + used, 1, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) goto io_error;
+        if (n == 0) break;
+        if (response[used++] == '\n') break;
+    }
+    close(fd);
+    response[used] = '\0';
+    if (strcmp(response, "OK\n") != 0) {
+        PyErr_Format(PyExc_RuntimeError, "ANOTA_SYSCALL monitor rejected policy: %s",
+                     used ? response : "connection closed without acknowledgement");
+        return -1;
+    }
+    return 0;
+io_error: {
+    int saved = errno;
+    close(fd); errno = saved;
+    PyErr_SetFromErrnoWithFilename(PyExc_OSError, path);
+    return -1;
+}
+#else
+    PyErr_SetString(PyExc_NotImplementedError, "Aya syscall monitoring requires Linux");
     return -1;
 #endif
 }
@@ -91,6 +106,7 @@ typedef struct {
     PyObject *blocked_syscalls;   /* set of uppercase syscall names */
     PyObject *allowed_syscalls;   /* set of uppercase syscall names */
     PyObject *path_policies;      /* dict: op_name -> (allow_list, block_list) */
+    PyObject *records;           /* independent annotation tokens */
     PyObject *operation_cache;    /* dict: attr name -> AnotaSyscallOperationObject */
 } AnotaSyscallObject;
 
@@ -103,6 +119,142 @@ typedef struct {
 static PyTypeObject AnotaSyscall_Type;
 static PyTypeObject AnotaSyscallOperation_Type;
 static PyObject *anota_syscall_singleton = NULL;
+
+static int
+monitor_requested(void)
+{
+    const char *backend = getenv("ANOTA_SYSCALL_BACKEND");
+    return monitor_enabled || (backend && strcmp(backend, "ebpf") == 0);
+}
+
+static PyObject *
+kernel_operations(AnotaSyscallObject *self)
+{
+    PyObject *result = PyDict_New();
+    if (!result) return NULL;
+    Py_ssize_t pos = 0;
+    PyObject *name, *rules;
+    while (PyDict_Next(self->path_policies, &pos, &name, &rules)) {
+        PyObject *pair = Py_BuildValue("([],[])");
+        if (!pair) { Py_DECREF(result); return NULL; }
+        for (int side = 0; side < 2; side++) {
+            PyObject *entries = PyTuple_GET_ITEM(rules, side);
+            for (Py_ssize_t i = 0; i < PyList_GET_SIZE(entries); i++) {
+                PyObject *entry = PyList_GET_ITEM(entries, i);
+                int kind = PyLong_AsLong(PyTuple_GET_ITEM(entry, 0)) & POLICY_ENTRY_BASE_MASK;
+                if (kind <= POLICY_ENTRY_PROTOCOL && PyList_Append(PyTuple_GET_ITEM(pair, side), entry) < 0) {
+                    Py_DECREF(pair); Py_DECREF(result); return NULL;
+                }
+            }
+        }
+        if (PyList_GET_SIZE(PyTuple_GET_ITEM(pair, 0)) || PyList_GET_SIZE(PyTuple_GET_ITEM(pair, 1))) {
+            if (PyDict_SetItem(result, name, pair) < 0) { Py_DECREF(pair); Py_DECREF(result); return NULL; }
+        }
+        Py_DECREF(pair);
+    }
+    return result;
+}
+
+static int
+sync_policy(AnotaSyscallObject *self, long pid, const char *action)
+{
+    PyObject *blocked = NULL, *allowed = NULL, *message = NULL;
+    PyObject *json = NULL, *encoded = NULL, *line = NULL, *operations = NULL;
+    int result = -1;
+    monitor_syncing = 1;
+    blocked = PySequence_List(self->blocked_syscalls);
+    allowed = PySequence_List(self->allowed_syscalls);
+    operations = kernel_operations(self);
+    if (blocked == NULL || allowed == NULL || operations == NULL) goto done;
+    message = Py_BuildValue("{s:i,s:s,s:l,s:O,s:O,s:O}",
+        "version", 1, "action", action, "pid", pid,
+        "blocked", blocked, "allowed", allowed, "operations", operations);
+    if (message == NULL) goto done;
+    json = PyImport_ImportModule("json");
+    if (json == NULL) goto done;
+    encoded = PyObject_CallMethod(json, "dumps", "O", message);
+    if (encoded == NULL) goto done;
+    line = PyUnicode_FromFormat("%U\n", encoded);
+    if (line == NULL) goto done;
+    Py_ssize_t size;
+    const char *bytes = PyUnicode_AsUTF8AndSize(line, &size);
+    if (bytes == NULL) goto done;
+    if (size > 1024 * 1024) {
+        PyErr_SetString(PyExc_ValueError, "ANOTA_SYSCALL policy exceeds 1 MiB");
+        goto done;
+    }
+    result = send_monitor_command(bytes, size);
+    if (result == 0) {
+        monitor_enabled = strcmp(action, "stop") != 0;
+        monitor_target_pid = pid;
+#ifndef MS_WINDOWS
+        monitor_origin_pid = (long)getpid();
+#endif
+    }
+ done:
+    Py_XDECREF(operations);
+    Py_XDECREF(line); Py_XDECREF(encoded); Py_XDECREF(json);
+    Py_XDECREF(message); Py_XDECREF(allowed); Py_XDECREF(blocked);
+    monitor_syncing = 0;
+    return result;
+}
+
+typedef struct {
+    PyObject *blocked, *allowed, *paths;
+} PolicyBackup;
+
+static void
+backup_free(PolicyBackup *backup)
+{
+    Py_XDECREF(backup->blocked); Py_XDECREF(backup->allowed); Py_XDECREF(backup->paths);
+}
+
+static int
+backup_policy(AnotaSyscallObject *self, PolicyBackup *backup)
+{
+    memset(backup, 0, sizeof(*backup));
+    backup->blocked = PySet_New(self->blocked_syscalls);
+    backup->allowed = PySet_New(self->allowed_syscalls);
+    backup->paths = PyDict_New();
+    if (!backup->blocked || !backup->allowed || !backup->paths) goto error;
+    PyObject *key, *value;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(self->path_policies, &pos, &key, &value)) {
+        PyObject *allow = PySequence_List(PyTuple_GET_ITEM(value, 0));
+        PyObject *block = PySequence_List(PyTuple_GET_ITEM(value, 1));
+        PyObject *pair = (allow && block) ? PyTuple_Pack(2, allow, block) : NULL;
+        Py_XDECREF(allow); Py_XDECREF(block);
+        if (!pair) goto error;
+        int rc = PyDict_SetItem(backup->paths, key, pair);
+        Py_DECREF(pair);
+        if (rc < 0) goto error;
+    }
+    return 0;
+ error:
+    backup_free(backup);
+    return -1;
+}
+
+static PyObject *
+finish_policy_change(AnotaSyscallObject *self, PolicyBackup *backup, PyObject *result)
+{
+#ifndef MS_WINDOWS
+    if (result != NULL && monitor_requested() &&
+        sync_policy(self, (monitor_enabled && monitor_origin_pid == (long)getpid())
+            ? monitor_target_pid : (long)getpid(), "replace") < 0) {
+        Py_CLEAR(result);
+    }
+#endif
+    if (result == NULL) {
+        Py_SETREF(self->blocked_syscalls, backup->blocked);
+        Py_SETREF(self->allowed_syscalls, backup->allowed);
+        Py_SETREF(self->path_policies, backup->paths);
+        memset(backup, 0, sizeof(*backup));
+    }
+    backup_free(backup);
+    return result;
+}
+
 
 
 /* ------------------------------------------------------------------------- */
@@ -281,6 +433,22 @@ normalize_domain_value(PyObject *value)
     lower = PyObject_CallMethod(text, "casefold", NULL);
     Py_DECREF(text);
     return lower;
+}
+
+static PyObject *
+normalize_url_value(PyObject *value, int kind)
+{
+    if (!PyUnicode_Check(value) || PyUnicode_GET_LENGTH(value) == 0 ||
+        PyUnicode_FindChar(value, 0, 0, PyUnicode_GET_LENGTH(value), 1) >= 0) {
+        PyErr_SetString(PyExc_ValueError, "URL policy values must be nonempty strings without NUL");
+        return NULL;
+    }
+    PyObject *module = PyImport_ImportModule("anota_url");
+    if (!module) return NULL;
+    PyObject *result = PyObject_CallMethod(module,
+        kind == POLICY_ENTRY_HOST ? "normalize_host" : "normalize_scheme", "O", value);
+    Py_DECREF(module);
+    return result;
 }
 
 static PyObject *
@@ -505,6 +673,10 @@ append_policy_value(PyObject *list_obj, int base_kind, PyObject *value)
         break;
     case POLICY_ENTRY_PROTOCOL:
         normalized = normalize_protocol_value(value);
+        break;
+    case POLICY_ENTRY_SCHEME:
+    case POLICY_ENTRY_HOST:
+        normalized = normalize_url_value(value, base_kind);
         break;
     default:
         PyErr_SetString(PyExc_ValueError, "unsupported policy kind");
@@ -764,7 +936,7 @@ report_violation(const char *syscall_name,
 /* Operation object                                                          */
 
 static PyObject *
-operation_add_paths(AnotaSyscallOperationObject *op,
+operation_add_paths_impl(AnotaSyscallOperationObject *op,
                     PyObject *args,
                     PyObject *kwargs,
                     int is_allow)
@@ -778,114 +950,31 @@ operation_add_paths(AnotaSyscallOperationObject *op,
 
     Py_ssize_t positional = PyTuple_GET_SIZE(args);
     PyObject *value = NULL;
-    PyObject *path_kw = NULL;
-    PyObject *domain_kw = NULL;
-    PyObject *ip_kw = NULL;
-    PyObject *proto_kw = NULL;
     int base_kind = POLICY_ENTRY_PATH;
-
-    if (positional > 1) {
-        PyErr_SetString(PyExc_TypeError,
-                        "ANOTA_SYSCALL operation methods accept at most 1 "
-                        "positional argument");
+    if (positional > 1 || positional + (kwargs ? PyDict_GET_SIZE(kwargs) : 0) != 1) {
+        PyErr_SetString(PyExc_TypeError, "provide exactly one of PATH, DOMAIN, IP, PROTOCOL, SCHEME, HOST");
         return NULL;
     }
-
-    if (kwargs != NULL && PyDict_Size(kwargs) > 0) {
-        PyObject *tmp_lower, *tmp_upper;
-
-        tmp_lower = PyDict_GetItemString(kwargs, "path");
-        tmp_upper = PyDict_GetItemString(kwargs, "PATH");
-        if (tmp_lower && tmp_upper && tmp_lower != tmp_upper) {
-            PyErr_SetString(PyExc_TypeError,
-                            "PATH specified multiple times");
-            return NULL;
-        }
-        path_kw = tmp_lower ? tmp_lower : tmp_upper;
-
-        tmp_lower = PyDict_GetItemString(kwargs, "domain");
-        tmp_upper = PyDict_GetItemString(kwargs, "DOMAIN");
-        if (tmp_lower && tmp_upper && tmp_lower != tmp_upper) {
-            PyErr_SetString(PyExc_TypeError,
-                            "DOMAIN specified multiple times");
-            return NULL;
-        }
-        domain_kw = tmp_lower ? tmp_lower : tmp_upper;
-
-        tmp_lower = PyDict_GetItemString(kwargs, "ip");
-        tmp_upper = PyDict_GetItemString(kwargs, "IP");
-        if (tmp_lower && tmp_upper && tmp_lower != tmp_upper) {
-            PyErr_SetString(PyExc_TypeError,
-                            "IP specified multiple times");
-            return NULL;
-        }
-        ip_kw = tmp_lower ? tmp_lower : tmp_upper;
-
-        tmp_lower = PyDict_GetItemString(kwargs, "protocol");
-        tmp_upper = PyDict_GetItemString(kwargs, "PROTOCOL");
-        if (tmp_lower && tmp_upper && tmp_lower != tmp_upper) {
-            PyErr_SetString(PyExc_TypeError,
-                            "PROTOCOL specified multiple times");
-            return NULL;
-        }
-        proto_kw = tmp_lower ? tmp_lower : tmp_upper;
-
-        Py_ssize_t expected = 0;
-        if (path_kw) {
-            expected++;
-        }
-        if (domain_kw) {
-            expected++;
-        }
-        if (ip_kw) {
-            expected++;
-        }
-        if (proto_kw) {
-            expected++;
-        }
-        if (PyDict_Size(kwargs) > expected) {
-            PyErr_SetString(PyExc_TypeError,
-                            "unexpected keyword argument");
-            return NULL;
-        }
-    }
-
-    int provided = (positional > 0) +
-                   (path_kw ? 1 : 0) +
-                   (domain_kw ? 1 : 0) +
-                   (ip_kw ? 1 : 0) +
-                   (proto_kw ? 1 : 0);
-
-    if (provided == 0) {
-        PyErr_SetString(PyExc_TypeError,
-                        "one of PATH, DOMAIN, IP, or PROTOCOL must be provided");
-        return NULL;
-    }
-    if (provided > 1) {
-        PyErr_SetString(PyExc_TypeError,
-                        "provide only one of PATH, DOMAIN, IP, or PROTOCOL");
-        return NULL;
-    }
-
-    if (positional == 1) {
-        value = PyTuple_GET_ITEM(args, 0);
-        base_kind = POLICY_ENTRY_PATH;
-    }
-    else if (path_kw) {
-        value = path_kw;
-        base_kind = POLICY_ENTRY_PATH;
-    }
-    else if (domain_kw) {
-        value = domain_kw;
-        base_kind = POLICY_ENTRY_DOMAIN;
-    }
-    else if (ip_kw) {
-        value = ip_kw;
-        base_kind = POLICY_ENTRY_IP;
-    }
+    if (positional) value = PyTuple_GET_ITEM(args, 0);
     else {
-        value = proto_kw;
-        base_kind = POLICY_ENTRY_PROTOCOL;
+        Py_ssize_t pos = 0;
+        PyObject *name;
+        PyDict_Next(kwargs, &pos, &name, &value);
+        const char *key = PyUnicode_AsUTF8(name);
+        if (!key) return NULL;
+        if (equals_ignore_case(key, "PATH")) base_kind = POLICY_ENTRY_PATH;
+        else if (equals_ignore_case(key, "DOMAIN")) base_kind = POLICY_ENTRY_DOMAIN;
+        else if (equals_ignore_case(key, "IP")) base_kind = POLICY_ENTRY_IP;
+        else if (equals_ignore_case(key, "PROTOCOL")) base_kind = POLICY_ENTRY_PROTOCOL;
+        else if (equals_ignore_case(key, "SCHEME")) base_kind = POLICY_ENTRY_SCHEME;
+        else if (equals_ignore_case(key, "HOST")) base_kind = POLICY_ENTRY_HOST;
+        else { PyErr_SetString(PyExc_TypeError, "unexpected keyword argument"); return NULL; }
+    }
+    if (base_kind >= POLICY_ENTRY_SCHEME &&
+        PyUnicode_CompareWithASCIIString(op->op_name, "NETWORK") != 0 &&
+        PyUnicode_CompareWithASCIIString(op->op_name, "URL") != 0) {
+        PyErr_SetString(PyExc_ValueError, "SCHEME/HOST policies require NETWORK or URL scope");
+        return NULL;
     }
 
     if (append_policy_value(target, base_kind, value) < 0) {
@@ -893,6 +982,108 @@ operation_add_paths(AnotaSyscallOperationObject *op,
     }
 
     Py_RETURN_NONE;
+}
+
+static int
+syscall_rebuild(AnotaSyscallObject *self, PyObject *skip)
+{
+    if (PySet_Clear(self->blocked_syscalls) < 0 || PySet_Clear(self->allowed_syscalls) < 0) return -1;
+    PyDict_Clear(self->path_policies);
+    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(self->records); i++) {
+        PyObject *r = PyList_GET_ITEM(self->records, i);
+        if (r == skip || PyList_GET_ITEM(r, 0) != Py_True) continue;
+        PyObject *scope = PyList_GET_ITEM(r, 1), *entries = PyList_GET_ITEM(r, 3);
+        int allow = PyList_GET_ITEM(r, 2) == Py_True;
+        PyObject *target = allow ? self->allowed_syscalls : self->blocked_syscalls;
+        if (scope != Py_None) {
+            PyObject *pair = ensure_policy_tuple(self, scope, 1);
+            if (!pair) return -1;
+            target = PyTuple_GET_ITEM(pair, allow ? POLICY_ALLOW_INDEX : POLICY_BLOCK_INDEX);
+        }
+        for (Py_ssize_t j = 0; j < PyList_GET_SIZE(entries); j++) {
+            PyObject *entry = PyList_GET_ITEM(entries, j);
+            int rc = scope == Py_None ? PySet_Add(target, entry) : PyList_Append(target, entry);
+            if (rc < 0) return -1;
+        }
+    }
+    return 0;
+}
+
+static int
+syscall_remove(PyObject *token)
+{
+    AnotaSyscallObject *self = get_singleton_struct();
+    PolicyBackup backup;
+    if (backup_policy(self, &backup) < 0) return -1;
+    PyObject *result = NULL;
+    if (syscall_rebuild(self, token) == 0) { Py_INCREF(Py_None); result = Py_None; }
+    result = finish_policy_change(self, &backup, result);
+    if (!result) return -1;
+    Py_DECREF(result);
+    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(self->records); i++)
+        if (PyList_GET_ITEM(self->records, i) == token) return PySequence_DelItem(self->records, i);
+    return 0;
+}
+
+static PyObject *
+record_change(AnotaSyscallObject *self, PolicyBackup *backup,
+              PyObject *scope, int allow, PyObject *entries)
+{
+    PyObject *token = entries ? Py_BuildValue("[OOOO]", Py_True, scope,
+                                allow ? Py_True : Py_False, entries) : NULL;
+    PyObject *handle = token ? _PyAnotaPolicy_New(token, syscall_remove) : NULL;
+    int added = handle && PyList_Append(self->records, token) == 0;
+    if (!added) Py_CLEAR(handle);
+    PyObject *result = finish_policy_change(self, backup, handle);
+    if (!result && added) PySequence_DelItem(self->records, PyList_GET_SIZE(self->records) - 1);
+    Py_XDECREF(token);
+    return result;
+}
+
+static void
+invalidate_records(AnotaSyscallObject *self, PyObject *scope)
+{
+    for (Py_ssize_t i = PyList_GET_SIZE(self->records); i-- > 0;) {
+        PyObject *r = PyList_GET_ITEM(self->records, i);
+        if (scope == NULL || PyObject_RichCompareBool(scope, PyList_GET_ITEM(r, 1), Py_EQ) == 1) {
+            _PyAnotaPolicy_Invalidate(r);
+            PySequence_DelItem(self->records, i);
+        }
+    }
+}
+
+static PyObject *
+operation_add_paths(AnotaSyscallOperationObject *op, PyObject *args,
+                    PyObject *kwargs, int is_allow)
+{
+    PolicyBackup backup;
+    if (backup_policy(op->owner, &backup) < 0) return NULL;
+    PyObject *old = PyDict_GetItemWithError(backup.paths, op->op_name);
+    int side = is_allow ? POLICY_ALLOW_INDEX : POLICY_BLOCK_INDEX;
+    Py_ssize_t start = old ? PyList_GET_SIZE(PyTuple_GET_ITEM(old, side)) : 0;
+    PyObject *result = operation_add_paths_impl(op, args, kwargs, is_allow);
+    if (!result) return finish_policy_change(op->owner, &backup, NULL);
+    Py_DECREF(result);
+    PyObject *all = PyTuple_GET_ITEM(operation_get_policy(op), side);
+    PyObject *entries = PyList_GetSlice(all, start, PyList_GET_SIZE(all));
+    result = record_change(op->owner, &backup, op->op_name, is_allow, entries);
+    Py_XDECREF(entries);
+    return result;
+}
+
+static PyObject *
+operation_clear(AnotaSyscallOperationObject *op, PyObject *Py_UNUSED(ignored))
+{
+    PolicyBackup backup;
+    if (backup_policy(op->owner, &backup) < 0) return NULL;
+    if (PyDict_DelItem(op->owner->path_policies, op->op_name) < 0) {
+        if (PyErr_ExceptionMatches(PyExc_KeyError)) PyErr_Clear();
+        else return finish_policy_change(op->owner, &backup, NULL);
+    }
+    Py_INCREF(Py_None);
+    PyObject *result = finish_policy_change(op->owner, &backup, Py_None);
+    if (result) invalidate_records(op->owner, op->op_name);
+    return result;
 }
 
 static PyObject *
@@ -912,6 +1103,8 @@ operation_allow(AnotaSyscallOperationObject *op,
 }
 
 static PyMethodDef AnotaSyscallOperation_methods[] = {
+    {"CLEAR", (PyCFunction)operation_clear, METH_NOARGS,
+     PyDoc_STR("Clear policies for this operation and synchronize the monitor.")},
     {"BLOCK", (PyCFunction)(void(*)(void))operation_block,
      METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("BLOCK(PATH=..., DOMAIN=..., IP=..., PROTOCOL=...)\n"
@@ -969,7 +1162,7 @@ static PyTypeObject AnotaSyscallOperation_Type = {
 /* Policy object                                                             */
 
 static PyObject *
-anota_syscall_block(AnotaSyscallObject *self, PyObject *args)
+anota_syscall_block_impl(AnotaSyscallObject *self, PyObject *args)
 {
     Py_ssize_t nargs = PyTuple_GET_SIZE(args);
     if (nargs == 0) {
@@ -987,7 +1180,7 @@ anota_syscall_block(AnotaSyscallObject *self, PyObject *args)
 }
 
 static PyObject *
-anota_syscall_allow(AnotaSyscallObject *self, PyObject *args)
+anota_syscall_allow_impl(AnotaSyscallObject *self, PyObject *args)
 {
     Py_ssize_t nargs = PyTuple_GET_SIZE(args);
     if (nargs == 0) {
@@ -1005,7 +1198,7 @@ anota_syscall_allow(AnotaSyscallObject *self, PyObject *args)
 }
 
 static PyObject *
-anota_syscall_clear(AnotaSyscallObject *self, PyObject *Py_UNUSED(ignored))
+anota_syscall_clear_impl(AnotaSyscallObject *self, PyObject *Py_UNUSED(ignored))
 {
     if (PySet_Clear(self->blocked_syscalls) < 0) {
         return NULL;
@@ -1017,7 +1210,46 @@ anota_syscall_clear(AnotaSyscallObject *self, PyObject *Py_UNUSED(ignored))
     Py_RETURN_NONE;
 }
 
+static PyObject *
+add_global(AnotaSyscallObject *self, PyObject *args, int allow)
+{
+    PolicyBackup backup;
+    if (backup_policy(self, &backup) < 0) return NULL;
+    PyObject *result = allow ? anota_syscall_allow_impl(self, args) : anota_syscall_block_impl(self, args);
+    if (!result) return finish_policy_change(self, &backup, NULL);
+    Py_DECREF(result);
+    PyObject *entries = PyList_New(0);
+    if (entries) {
+        for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(args); i++) {
+            PyObject *name = normalize_syscall_name(PyTuple_GET_ITEM(args, i));
+            if (!name || PyList_Append(entries, name) < 0) {
+                Py_XDECREF(name); Py_CLEAR(entries); break;
+            }
+            Py_DECREF(name);
+        }
+    }
+    result = record_change(self, &backup, Py_None, allow, entries);
+    Py_XDECREF(entries);
+    return result;
+}
+static PyObject *anota_syscall_block(AnotaSyscallObject *self, PyObject *args)
+{ return add_global(self, args, 0); }
+static PyObject *anota_syscall_allow(AnotaSyscallObject *self, PyObject *args)
+{ return add_global(self, args, 1); }
+
+static PyObject *
+anota_syscall_clear(AnotaSyscallObject *self, PyObject *args)
+{
+    PolicyBackup backup;
+    if (backup_policy(self, &backup) < 0) return NULL;
+    PyObject *result = finish_policy_change(self, &backup, anota_syscall_clear_impl(self, args));
+    if (result) invalidate_records(self, NULL);
+    return result;
+}
+
 static PyMethodDef AnotaSyscall_methods[] = {
+    {"CLEAR", (PyCFunction)anota_syscall_clear, METH_NOARGS,
+     PyDoc_STR("Clear all syscall policies and synchronize the monitor.")},
     {"BLOCK", (PyCFunction)anota_syscall_block, METH_VARARGS,
      PyDoc_STR("BLOCK(name, ...)\n"
                "Block the named syscalls regardless of arguments.")},
@@ -1032,6 +1264,7 @@ static PyMethodDef AnotaSyscall_methods[] = {
 static void
 anota_syscall_dealloc(AnotaSyscallObject *self)
 {
+    Py_XDECREF(self->records);
     Py_XDECREF(self->blocked_syscalls);
     Py_XDECREF(self->allowed_syscalls);
     Py_XDECREF(self->path_policies);
@@ -1173,6 +1406,8 @@ _PyAnotaSyscall_GetSingleton(void)
         return NULL;
     }
 
+    self->records = PyList_New(0);
+    if (!self->records) { Py_DECREF(self); return NULL; }
     anota_syscall_singleton = (PyObject *)self;
     Py_INCREF(anota_syscall_singleton);
     return anota_syscall_singleton;
@@ -1184,6 +1419,10 @@ _PyAnotaSyscall_Check(const char *syscall_name,
                       const char *operation,
                       const char *target_kind_name)
 {
+    /* Kernel events are authoritative in eBPF mode. Avoid duplicate wrapper
+       diagnostics and recursion while serializing control messages. */
+    if (monitor_enabled || monitor_syncing) return 0;
+
     AnotaSyscallObject *self = get_singleton_struct();
     if (self == NULL) {
         return 0;
@@ -1301,61 +1540,116 @@ cleanup:
 }
 
 PyObject *
-_PyAnotaSyscall_SignalStart(PyObject *Py_UNUSED(self),
-                            PyObject *args,
-                            PyObject *kwds)
+_PyAnotaSyscall_SignalStart(PyObject *Py_UNUSED(self), PyObject *args, PyObject *kwargs)
 {
-    PyObject *pid_obj = Py_None;
     static char *kwlist[] = {"pid", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwds,
-                                     "|O:ANOTA_SYSCALL_SIGNAL_START",
-                                     kwlist, &pid_obj)) {
+    PyObject *pid_obj = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|O:ANOTA_SYSCALL_SIGNAL_START",
+                                    kwlist, &pid_obj)) return NULL;
+#ifndef MS_WINDOWS
+    long pid = pid_obj == Py_None ? (long)getpid() : PyLong_AsLong(pid_obj);
+    if (pid == -1 && PyErr_Occurred()) return NULL;
+    if (pid <= 0 || (unsigned long)pid > 0xffffffffUL) {
+        PyErr_SetString(PyExc_ValueError, "pid must be a positive 32-bit process id");
         return NULL;
     }
-
-    Py_ssize_t pid = 0;
-    int has_pid = 0;
-    if (!Py_IsNone(pid_obj)) {
-        pid = PyLong_AsSsize_t(pid_obj);
-        if (pid == -1 && PyErr_Occurred()) {
-            return NULL;
-        }
-        if (pid < 0) {
-            PyErr_SetString(PyExc_ValueError,
-                            "pid must be greater than or equal to 0");
-            return NULL;
-        }
-        has_pid = 1;
-    }
-
-    char buffer[64];
-    Py_ssize_t length;
-    if (has_pid) {
-        length = PyOS_snprintf(buffer, sizeof(buffer),
-                               "START %zd\n", pid);
-        if (length < 0 || length >= (Py_ssize_t)sizeof(buffer)) {
-            PyErr_SetString(PyExc_OverflowError,
-                            "pid is too large");
-            return NULL;
-        }
-    }
-    else {
-        strcpy(buffer, "START\n");
-        length = (Py_ssize_t)strlen(buffer);
-    }
-
-    if (send_monitor_command(buffer, length) < 0) {
-        return NULL;
-    }
+    if (sync_policy(get_singleton_struct(), pid, "replace") < 0) return NULL;
     Py_RETURN_NONE;
+#else
+    PyErr_SetString(PyExc_NotImplementedError, "Aya syscall monitoring requires Linux");
+    return NULL;
+#endif
 }
 
 PyObject *
 _PyAnotaSyscall_SignalStop(PyObject *Py_UNUSED(self), PyObject *Py_UNUSED(ignored))
 {
-    static const char stop_cmd[] = "STOP\n";
-    if (send_monitor_command(stop_cmd, (Py_ssize_t)strlen(stop_cmd)) < 0) {
-        return NULL;
+#ifndef MS_WINDOWS
+    if (sync_policy(get_singleton_struct(), (monitor_enabled && monitor_origin_pid == (long)getpid())
+        ? monitor_target_pid : (long)getpid(), "stop") < 0) return NULL;
+    Py_RETURN_NONE;
+#else
+    PyErr_SetString(PyExc_NotImplementedError, "Aya syscall monitoring requires Linux");
+    return NULL;
+#endif
+}
+
+int
+_PyAnotaSyscall_ClearAll(void)
+{
+    AnotaSyscallObject *self = get_singleton_struct();
+    if (!self) return 0;
+    PyObject *result = anota_syscall_clear(self, NULL);
+    if (!result) return -1;
+    Py_DECREF(result);
+    return 0;
+}
+
+static int
+url_kind_present(PyObject *rules, int kind)
+{
+    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(rules); i++) {
+        PyObject *entry = PyList_GET_ITEM(rules, i);
+        if ((PyLong_AsLong(PyTuple_GET_ITEM(entry, 0)) & POLICY_ENTRY_BASE_MASK) == kind) return 1;
+    }
+    return 0;
+}
+
+static int
+url_matches(PyObject *rules, int kind, PyObject *value)
+{
+    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(rules); i++) {
+        PyObject *entry = PyList_GET_ITEM(rules, i);
+        if ((PyLong_AsLong(PyTuple_GET_ITEM(entry, 0)) & POLICY_ENTRY_BASE_MASK) != kind) continue;
+        int rc = unicode_match_wildcard(PyTuple_GET_ITEM(entry, 1), value);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+
+PyObject *
+_PyAnotaSyscall_URLActive(PyObject *self_obj, PyObject *unused)
+{
+    AnotaSyscallObject *self = get_singleton_struct();
+    if (!self || monitor_syncing) Py_RETURN_FALSE;
+    Py_ssize_t pos = 0;
+    PyObject *key, *pair;
+    while (PyDict_Next(self->path_policies, &pos, &key, &pair))
+        for (int i = 0; i < 2; i++)
+            if (url_kind_present(PyTuple_GET_ITEM(pair, i), POLICY_ENTRY_SCHEME) ||
+                url_kind_present(PyTuple_GET_ITEM(pair, i), POLICY_ENTRY_HOST)) Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+}
+
+PyObject *
+_PyAnotaSyscall_CheckURL(PyObject *self_obj, PyObject *args)
+{
+    PyObject *scheme, *host;
+    if (!PyArg_ParseTuple(args, "UU:_ANOTA_CHECK_URL", &scheme, &host)) return NULL;
+    AnotaSyscallObject *self = get_singleton_struct();
+    if (!self || monitor_syncing) Py_RETURN_NONE;
+    const char *scopes[] = {"NETWORK", "URL"};
+    for (int scope = 0; scope < 2; scope++) {
+        PyObject *pair = PyDict_GetItemString(self->path_policies, scopes[scope]);
+        if (!pair) continue;
+        PyObject *allow = PyTuple_GET_ITEM(pair, 0), *block = PyTuple_GET_ITEM(pair, 1);
+        for (int kind = POLICY_ENTRY_SCHEME; kind <= POLICY_ENTRY_HOST; kind++) {
+            PyObject *value = kind == POLICY_ENTRY_SCHEME ? scheme : host;
+            int denied = url_matches(block, kind, value);
+            if (denied < 0) return NULL;
+            const char *reason = denied ? "target blocked" : NULL;
+            if (!denied && url_kind_present(allow, kind)) {
+                int allowed = url_matches(allow, kind, value);
+                if (allowed < 0) return NULL;
+                if (!allowed) reason = "target not in allow list";
+            }
+            if (reason) report_violation("URL", scopes[scope],
+                            kind == POLICY_ENTRY_SCHEME ? "SCHEME" : "HOST", value, reason);
+        }
     }
     Py_RETURN_NONE;
 }
+
+int
+_PyAnotaSyscall_IsController(PyObject *obj)
+{ return Py_TYPE(obj) == &AnotaSyscall_Type || Py_TYPE(obj) == &AnotaSyscallOperation_Type; }

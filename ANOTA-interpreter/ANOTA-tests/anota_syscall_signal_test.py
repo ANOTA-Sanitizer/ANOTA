@@ -1,125 +1,89 @@
-"""Smoke tests for ANOTA_SYSCALL_SIGNAL_START / STOP helpers.
+"""Annotation-to-daemon protocol regressions; no eBPF/root required.
 
-This script spins up a lightweight UNIX domain socket server that mimics the
-Rust monitoring daemon. It verifies that the Python helpers emit the expected
-commands and handle responses without errors.
-
-Run with the ANOTA-enabled interpreter:
-
-    ./python ANOTA-tests/anota_syscall_signal_test.py
+Run with ./python ANOTA-tests/anota_syscall_signal_test.py.
+The mock server is a separate process because annotation synchronization holds
+CPython's GIL while waiting for the acknowledgement.
 """
-
-from __future__ import annotations
-
-import builtins
-import errno
+import json
 import os
+from pathlib import Path
 import socket
-import threading
-import time
+import subprocess
 import sys
+import tempfile
 
-SOCKET_PATH = "/tmp/anota_syscall.sock"
+
+def server(path, log):
+    with socket.socket(socket.AF_UNIX) as listener:
+        listener.bind(path)
+        listener.listen()
+        print("ready", flush=True)
+        for _ in range(10):
+            with listener.accept()[0] as stream:
+                request = json.loads(stream.makefile("rb").readline())
+                with open(log, "a") as output:
+                    output.write(json.dumps(request) + "\n")
+                if "NO_ACK" in request["blocked"]:
+                    continue
+                reply = b"ERR deliberately rejected\n" if "FORCED_REJECTION" in request["blocked"] else b"OK\n"
+                stream.sendall(reply)
 
 
-class DummyMonitorServer:
-    """Simple server that collects commands sent to the control socket."""
-
-    def __init__(self) -> None:
-        if os.path.exists(SOCKET_PATH):
-            os.unlink(SOCKET_PATH)
-        self._stop = threading.Event()
-        self._commands: list[str] = []
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.bind(SOCKET_PATH)
-        self._sock.listen(1)
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-
-    @property
-    def commands(self) -> list[str]:
-        return self._commands
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def close(self) -> None:
-        self._stop.set()
+def main():
+    ctrl = ANOTA_SYSCALL
+    ctrl.clear()
+    old_socket = os.environ.get("ANOTA_SYSCALL_SOCKET")
+    old_backend = os.environ.get("ANOTA_SYSCALL_BACKEND")
+    with tempfile.TemporaryDirectory(prefix="anota-protocol-") as tmp:
+        path, log = str(Path(tmp) / "monitor.sock"), str(Path(tmp) / "requests.jsonl")
+        env = dict(os.environ, ANOTA_SYSCALL_BACKEND="local")
+        child = subprocess.Popen([sys.executable, __file__, "--server", path, log],
+                                 stdout=subprocess.PIPE, text=True, env=env)
         try:
-            self._sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        self._sock.close()
-        if os.path.exists(SOCKET_PATH):
-            os.unlink(SOCKET_PATH)
-        self._thread.join(timeout=1)
-
-    def _serve(self) -> None:
-        while not self._stop.is_set():
-            try:
-                conn, _ = self._sock.accept()
-            except OSError as exc:
-                if exc.errno in {errno.EBADF, errno.ENOTSOCK}:
-                    break
-                continue
-            with conn:
-                data = b""
-                while True:
-                    chunk = conn.recv(1024)
-                    if not chunk:
-                        break
-                    data += chunk
-                    if b"\n" in data:
-                        break
+            assert child.stdout.readline().strip() == "ready"
+            os.environ["ANOTA_SYSCALL_SOCKET"] = path
+            os.environ["ANOTA_SYSCALL_BACKEND"] = "local"
+            ctrl.READ.BLOCK(PATH="/tmp/audit-secret")
+            ANOTA_SYSCALL_SIGNAL_START()                     # 0: initial snapshot
+            ctrl.WRITE.BLOCK(PATH="/tmp/quote\"\nfile")        # 1: JSON escaping
+            ctrl.READ.CLEAR()                                # 2: scoped clear
+            for bad in ["FORCED_REJECTION", "NO_ACK"]:       # 3,4: rollback
                 try:
-                    decoded = data.decode()
-                except UnicodeDecodeError:
-                    decoded = ""
-                if decoded:
-                    self._commands.append(decoded)
-                try:
-                    conn.sendall(b"OK\n")
-                except OSError:
+                    ctrl.BLOCK(bad)
+                except RuntimeError:
                     pass
-
-
-def ensure_helpers_available() -> None:
-    missing = [
-        name
-        for name in ("ANOTA_SYSCALL_SIGNAL_START", "ANOTA_SYSCALL_SIGNAL_STOP")
-        if not hasattr(builtins, name)
-    ]
-    if missing:
-        raise RuntimeError(
-            "Missing builtin(s): {}. "
-            "Are you running the ANOTA-enabled interpreter?".format(
-                ", ".join(missing)
-            )
-        )
-
-
-def main() -> int:
-    if os.name != "posix":
-        print("This test only runs on Unix platforms.")
-        return 0
-
-    ensure_helpers_available()
-    server = DummyMonitorServer()
-    server.start()
-    try:
-        builtins.ANOTA_SYSCALL_SIGNAL_START(pid=os.getpid())
-        builtins.ANOTA_SYSCALL_SIGNAL_START()
-        builtins.ANOTA_SYSCALL_SIGNAL_STOP()
-        time.sleep(0.1)
-        expected = ["START {}\n".format(os.getpid()), "START\n", "STOP\n"]
-        if server.commands[:3] != expected:
-            raise AssertionError(
-                "Unexpected command sequence: {!r}".format(server.commands)
-            )
-        print("ANOTA_SYSCALL signal helpers: OK")
-        return 0
-    finally:
-        server.close()
+                else:
+                    raise AssertionError("monitor rejection/EOF must raise")
+            ctrl.BLOCK("getppid")                            # 5: rollback verified
+            ctrl.CLEAR()                                     # 6: global clear
+            ANOTA_SYSCALL_SIGNAL_STOP()                      # 7
+            os.environ["ANOTA_SYSCALL_BACKEND"] = "ebpf"
+            ctrl.BLOCK("getppid")                            # 8: automatic install
+            ANOTA_SYSCALL_SIGNAL_STOP()                      # 9
+            child.wait(timeout=10)
+            assert child.returncode == 0
+            requests = [json.loads(line) for line in Path(log).read_text().splitlines()]
+            assert len(requests) == 10
+            assert all(r["version"] == 1 and r["pid"] == os.getpid() for r in requests)
+            assert requests[0]["operations"]["READ"][1] == [[1, "/tmp/audit-secret"]]
+            assert requests[1]["operations"]["WRITE"][1] == [[1, '/tmp/quote"\nfile']]
+            assert "READ" not in requests[2]["operations"]
+            assert requests[5]["blocked"] == ["GETPPID"]
+            assert requests[6]["operations"] == {} and requests[6]["blocked"] == []
+            assert requests[7]["action"] == requests[9]["action"] == "stop"
+            assert requests[8]["action"] == "replace"
+            print("ANOTA syscall protocol: all assertions passed")
+        finally:
+            if child.poll() is None:
+                child.terminate()
+                child.wait(timeout=5)
+            for key, previous in [("ANOTA_SYSCALL_SOCKET", old_socket), ("ANOTA_SYSCALL_BACKEND", old_backend)]:
+                if previous is None: os.environ.pop(key, None)
+                else: os.environ[key] = previous
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    if len(sys.argv) > 1 and sys.argv[1] == "--server":
+        server(*sys.argv[2:])
+    else:
+        main()

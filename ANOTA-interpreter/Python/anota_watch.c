@@ -1,5 +1,6 @@
 #include "Python.h"
 #include "anota_watch.h"
+#include "anota_policy.h"
 #include "methodobject.h"
 #include "pycore_pystate.h"   // _PyThreadState_GET()
 #include "pycore_pyerrors.h"  // _PyErr_SetString
@@ -62,6 +63,7 @@
 
 typedef struct {
     PyObject_HEAD
+    PyObject *records;  /* independent annotation tokens, retaining targets */
     PyObject *policies;  /* dict: (obj, key) -> PyLong( (allow<<8)|block ) */
 } AnotaWatchObject;
 
@@ -100,6 +102,7 @@ typedef struct {
 #endif
 
 static int anota_native_watch_depth = 0;
+static int access_check_depth = 0;
 
 
 /* --- helpers ---------------------------------------------------------- */
@@ -811,7 +814,7 @@ anota_native_watch_begin_common(PyThreadState *tstate,
 
 /* Common implementation for all access checks. */
 static int
-_anota_check_access(PyThreadState *tstate,
+_anota_check_access_impl(PyThreadState *tstate,
                     PyObject *obj, PyObject *key,
                     unsigned char mode_bit,
                     const char *mode_str,
@@ -836,6 +839,16 @@ _anota_check_access(PyThreadState *tstate,
         return 0;
     }
 
+    /* Avoid invoking an unrelated object's key __hash__/__eq__ merely
+       because some other object has a WATCH annotation. */
+    int watched = 0;
+    for (Py_ssize_t i = 0; aw->records && i < PyList_GET_SIZE(aw->records); i++) {
+        if (PyList_GET_ITEM(PyList_GET_ITEM(aw->records, i), 1) == obj) {
+            watched = 1; break;
+        }
+    }
+    if (!watched) return 0;
+
     /* First: specific (obj, key) rule, if any. */
     if (key != NULL) {
         r = decide_for_entry(policies, obj, key, mode_bit);
@@ -851,9 +864,6 @@ _anota_check_access(PyThreadState *tstate,
             _PyErr_SetString(tstate, PyExc_RuntimeError,
                              "ANOTA_WATCH policy violation");
             return -1;
-        }
-        if (r == 1) {
-            return 0;  /* explicitly allowed */
         }
     }
 
@@ -876,6 +886,39 @@ _anota_check_access(PyThreadState *tstate,
     return 0;
 }
 
+
+static int
+_anota_check_access(PyThreadState *tstate, PyObject *obj, PyObject *key,
+                    unsigned char bit, const char *mode, const char *kind)
+{
+    if (access_check_depth || !anota_singleton ||
+        !get_singleton_struct()->policies ||
+        PyDict_GET_SIZE(get_singleton_struct()->policies) == 0) return 0;
+    access_check_depth++;
+    int rc = _anota_check_access_impl(tstate, obj, key, bit, mode, kind);
+    access_check_depth--;
+    return rc;
+}
+
+int
+_PyAnota_CheckAllMembers(PyObject *obj, int write)
+{
+    if (access_check_depth || !anota_singleton) return 0;
+    PyObject *policies = get_singleton_struct()->policies;
+    if (!policies || PyDict_GET_SIZE(policies) == 0) return 0;
+    access_check_depth++;
+    unsigned char mode = write ? ANOTA_MODE_W : ANOTA_MODE_R;
+    const char *name = write ? "W" : "R";
+    int rc = _anota_check_access_impl(PyThreadState_Get(), obj, NULL, mode, name, "object");
+    Py_ssize_t pos = 0;
+    PyObject *key, *value;
+    while (rc == 0 && PyDict_Next(policies, &pos, &key, &value)) {
+        if (PyLong_AsVoidPtr(PyTuple_GET_ITEM(key, 0)) == obj)
+            rc = _anota_check_access_impl(PyThreadState_Get(), obj, PyTuple_GET_ITEM(key, 1), mode, name, "member");
+    }
+    access_check_depth--;
+    return rc;
+}
 
 /* --- public C helpers used from ceval.c ------------------------------- */
 
@@ -1076,101 +1119,103 @@ _PyAnota_NativeWatchEnd(PyThreadState *tstate,
 
 /* --- ANOTA_WATCH Python object ---------------------------------------- */
 
-static PyObject *
-anota_allow(AnotaWatchObject *self, PyObject *args, PyObject *kwargs)
+static int
+watch_rebuild(AnotaWatchObject *self, PyObject *skip)
 {
-    static char *kwlist[] = {"obj", "modes", "key", NULL};
-    PyObject *obj;
-    PyObject *modes;
-    PyObject *key = Py_None;
-    unsigned char bits;
-
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs,
-                                     "OO|O:ALLOW", kwlist,
-                                     &obj, &modes, &key)) {
-        return NULL;
-    }
-    if (parse_modes(modes, &bits) < 0) {
-        return NULL;
-    }
-    if (self->policies == NULL) {
-        self->policies = PyDict_New();
-        if (self->policies == NULL) {
-            return NULL;
+    PyObject *policies = PyDict_New();
+    if (!policies) return -1;
+    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(self->records); i++) {
+        PyObject *r = PyList_GET_ITEM(self->records, i);
+        if (r == skip || PyList_GET_ITEM(r, 0) != Py_True) continue;
+        if (update_entry(policies, PyList_GET_ITEM(r, 1), PyList_GET_ITEM(r, 2),
+                         (unsigned char)PyLong_AsLong(PyList_GET_ITEM(r, 3)),
+                         PyList_GET_ITEM(r, 4) == Py_True) < 0) {
+            Py_DECREF(policies); return -1;
         }
     }
-    if (update_entry(self->policies, obj, key, bits, 1) < 0) {
-        return NULL;
+    Py_SETREF(self->policies, policies);
+    return 0;
+}
+
+static int
+watch_remove(PyObject *token)
+{
+    AnotaWatchObject *self = get_singleton_struct();
+    if (watch_rebuild(self, token) < 0) return -1;
+    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(self->records); i++) {
+        if (PyList_GET_ITEM(self->records, i) == token)
+            return PySequence_DelItem(self->records, i);
     }
-    Py_RETURN_NONE;
+    return 0;
 }
 
 static PyObject *
-anota_block(AnotaWatchObject *self, PyObject *args, PyObject *kwargs)
+watch_add(AnotaWatchObject *self, PyObject *args, PyObject *kwargs, int allow)
 {
     static char *kwlist[] = {"obj", "modes", "key", NULL};
-    PyObject *obj;
-    PyObject *modes;
-    PyObject *key = Py_None;
+    PyObject *obj, *modes, *key = Py_None;
     unsigned char bits;
-
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs,
-                                     "OO|O:BLOCK", kwlist,
-                                     &obj, &modes, &key)) {
-        return NULL;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|O", kwlist, &obj, &modes, &key) ||
+        parse_modes(modes, &bits) < 0) return NULL;
+    PyObject *token = Py_BuildValue("[OOOiO]", Py_True, obj, key, bits, allow ? Py_True : Py_False);
+    if (!token) return NULL;
+    PyObject *handle = _PyAnotaPolicy_New(token, watch_remove);
+    if (!handle || PyList_Append(self->records, token) < 0) {
+        Py_XDECREF(handle); Py_DECREF(token); return NULL;
     }
-    if (parse_modes(modes, &bits) < 0) {
-        return NULL;
+    if (watch_rebuild(self, NULL) < 0) {
+        PySequence_DelItem(self->records, PyList_GET_SIZE(self->records) - 1);
+        Py_DECREF(handle); handle = NULL;
     }
-    if (self->policies == NULL) {
-        self->policies = PyDict_New();
-        if (self->policies == NULL) {
-            return NULL;
-        }
-    }
-    if (update_entry(self->policies, obj, key, bits, 0) < 0) {
-        return NULL;
-    }
-    Py_RETURN_NONE;
+    Py_DECREF(token);
+    return handle;
 }
+
+static PyObject *anota_allow(AnotaWatchObject *self, PyObject *args, PyObject *kwargs)
+{ return watch_add(self, args, kwargs, 1); }
+static PyObject *anota_block(AnotaWatchObject *self, PyObject *args, PyObject *kwargs)
+{ return watch_add(self, args, kwargs, 0); }
 
 static PyObject *
 anota_clear(AnotaWatchObject *self, PyObject *args, PyObject *kwargs)
 {
     static char *kwlist[] = {"obj", "key", NULL};
-    PyObject *obj;
-    PyObject *key = Py_None;
-    PyObject *tkey;
-
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs,
-                                     "O|O:CLEAR", kwlist,
-                                     &obj, &key)) {
-        return NULL;
-    }
-    if (self->policies == NULL) {
-        Py_RETURN_NONE;
-    }
-    tkey = make_policy_key(obj,
-                           key == NULL ? (PyObject *)Py_None : key);
-    if (tkey == NULL) {
-        return NULL;
-    }
+    PyObject *obj, *key = Py_None;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|O:CLEAR", kwlist, &obj, &key)) return NULL;
+    PyObject *tkey = make_policy_key(obj, key);
+    if (!tkey) return NULL;
+    /* Validate key/hash before changing either representation. */
     if (PyDict_DelItem(self->policies, tkey) < 0) {
-        /* Ignore missing keys */
-        if (PyErr_ExceptionMatches(PyExc_KeyError)) {
-            PyErr_Clear();
-        }
+        if (PyErr_ExceptionMatches(PyExc_KeyError)) PyErr_Clear();
+        else { Py_DECREF(tkey); return NULL; }
     }
     Py_DECREF(tkey);
+    for (Py_ssize_t i = PyList_GET_SIZE(self->records); i-- > 0;) {
+        PyObject *r = PyList_GET_ITEM(self->records, i);
+        if (PyList_GET_ITEM(r, 1) != obj) continue;
+        int equal = PyObject_RichCompareBool(PyList_GET_ITEM(r, 2), key, Py_EQ);
+        if (equal < 0) return NULL;
+        if (equal) {
+            _PyAnotaPolicy_Invalidate(r);
+            if (PySequence_DelItem(self->records, i) < 0) return NULL;
+        }
+    }
     Py_RETURN_NONE;
 }
 
-static PyObject *
-anota_clear_all(AnotaWatchObject *self, PyObject *Py_UNUSED(ignored))
+void
+_PyAnotaWatch_ClearAll(void)
 {
-    if (self->policies != NULL) {
-        PyDict_Clear(self->policies);
-    }
+    if (!anota_singleton) return;
+    AnotaWatchObject *self = get_singleton_struct();
+    PyDict_Clear(self->policies);
+    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(self->records); i++)
+        _PyAnotaPolicy_Invalidate(PyList_GET_ITEM(self->records, i));
+    PyList_SetSlice(self->records, 0, PyList_GET_SIZE(self->records), NULL);
+}
+static PyObject *anota_clear_all(AnotaWatchObject *self, PyObject *unused)
+{
+    _PyAnotaWatch_ClearAll();
     Py_RETURN_NONE;
 }
 
@@ -1319,25 +1364,26 @@ done:
 static void
 anota_dealloc(AnotaWatchObject *self)
 {
+    Py_XDECREF(self->records);
     Py_XDECREF(self->policies);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
 static PyMethodDef anota_methods[] = {
-    {"ALLOW", (PyCFunction)anota_allow, METH_VARARGS | METH_KEYWORDS,
+    {"ALLOW", (PyCFunction)(void(*)(void))anota_allow, METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("ALLOW(obj, modes, key=None)\n"
                "Set allowed access modes for an object (and optional key).\n"
                "modes is a combination of 'R', 'W', 'X'.")},
-    {"BLOCK", (PyCFunction)anota_block, METH_VARARGS | METH_KEYWORDS,
+    {"BLOCK", (PyCFunction)(void(*)(void))anota_block, METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("BLOCK(obj, modes, key=None)\n"
                "Block selected access modes for an object (and optional key).")},
-    {"CLEAR", (PyCFunction)anota_clear, METH_VARARGS | METH_KEYWORDS,
+    {"CLEAR", (PyCFunction)(void(*)(void))anota_clear, METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("CLEAR(obj, key=None)\n"
                "Remove any policy for the given object/key.")},
     {"CLEAR_ALL", (PyCFunction)anota_clear_all, METH_NOARGS,
      PyDoc_STR("CLEAR_ALL()\n"
                "Remove all ANOTA_WATCH policies.")},
-    {"CON", (PyCFunction)anota_con, METH_VARARGS | METH_KEYWORDS,
+    {"CON", (PyCFunction)(void(*)(void))anota_con, METH_VARARGS | METH_KEYWORDS,
      PyDoc_STR("CON(callable, fixed_args, random_args, number_measurements=5000,\n"
                "    threshold=4.5, kwargs=None)\n"
                "Run a Dudect-style timing test inside the interpreter.\n"
@@ -1384,7 +1430,7 @@ static PyTypeObject AnotaWatch_Type = {
     0,                                  /* tp_dictoffset */
     0,                                  /* tp_init  */
     PyType_GenericAlloc,                /* tp_alloc */
-    PyType_GenericNew,                  /* tp_new   */
+    NULL,                               /* singleton: no public constructor */
 };
 
 
@@ -1406,8 +1452,9 @@ _PyAnotaWatch_GetSingleton(void)
     if (self == NULL) {
         return NULL;
     }
+    self->records = PyList_New(0);
     self->policies = PyDict_New();
-    if (self->policies == NULL) {
+    if (self->policies == NULL || self->records == NULL) {
         Py_DECREF(self);
         return NULL;
     }
@@ -1416,3 +1463,7 @@ _PyAnotaWatch_GetSingleton(void)
     Py_INCREF(anota_singleton);
     return anota_singleton;
 }
+
+int
+_PyAnotaWatch_IsController(PyObject *obj)
+{ return Py_TYPE(obj) == &AnotaWatch_Type; }

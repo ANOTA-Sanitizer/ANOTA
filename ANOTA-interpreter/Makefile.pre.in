@@ -347,6 +347,7 @@ PYTHON_OBJS=	\
 		Python/anota_watch.o \
 		Python/anota_execution.o \
 		Python/anota_taint.o \
+		Python/anota_policy.o \
 		Python/anota_syscall.o \
 		Python/codecs.o \
 		Python/ceval.o \

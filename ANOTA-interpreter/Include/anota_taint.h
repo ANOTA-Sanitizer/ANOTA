@@ -5,18 +5,21 @@ extern "C" {
 #endif
 
 #include "Python.h"
+PyAPI_FUNC(int) _PyAnotaTaint_IsController(PyObject *obj);
 
 /* Python-level entry:
  *
  *   ANOTA_TAINT(obj, sanitization=[hash], Sink=[print])
  *
- * Implemented as a built-in function that:
- *   - Marks obj as tainted.
+ * Implemented as a callable policy controller that:
+ *   - Marks obj as tainted and returns a removable policy handle.
  *   - Registers sanitization functions that clear taint from their return
  *     values.
  *   - Registers sink functions that will raise when called with tainted args.
  */
 PyAPI_FUNC(PyObject *) _PyAnota_Taint(PyObject *self, PyObject *args, PyObject *kwds);
+PyAPI_FUNC(PyObject *) _PyAnotaTaint_GetSingleton(void);
+PyAPI_FUNC(void) _PyAnotaTaint_ClearAll(void);
 
 /* Register taint/sanitizers/sinks from C (used by _PyAnota_Taint). */
 PyAPI_FUNC(int) _PyAnotaTaint_Register(PyObject *obj,
